@@ -195,12 +195,12 @@ function renderUps(card) {
     ${UPS_ROW('启用 UPS 监控', '关闭后不读取 UPS、不记录历史、不发通知，「电源」页与导航一起隐藏', `<button class="switch" type="button" role="switch" aria-checked="false" data-k="enabled" aria-label="启用 UPS 监控"></button>`)}
     <div class="set-sub">采集</div>
     ${UPS_ROW('UPS 设备名', '留空 = 自动发现（NUT 里有多台时才需要指定）', upsText('ups_name', '自动发现'), 'data-dep')}
-    ${UPS_ROW('采集周期', '默认 5 秒。NUT 驱动自身也有 2 秒轮询，设太小只是多花 CPU', upsNum('poll_interval', 3, 60, 1, '秒'))}
+    ${UPS_ROW('采集周期', '默认 5 秒。NUT 驱动自身也有 2 秒轮询，设太小只是多花 CPU', upsNum('poll_interval', 3, 60, 1, '秒'), 'data-dep')}
     <div class="set-sub">电池与健康评估</div>
-    ${UPS_ROW('电池容量', '铭牌 Ah（如 12V 9Ah 填 9）。填错会让健康判定整体偏移', upsNum('battery_ah', 0.5, 200, 0.5, 'Ah'))}
-    ${UPS_ROW('允许放电深度', '铅酸一般 80~85%，深循环可到 100%', upsNum('battery_dod', 30, 100, 1, '%'))}
+    ${UPS_ROW('电池容量', '铭牌 Ah（如 12V 9Ah 填 9）。填错会让健康判定整体偏移', upsNum('battery_ah', 0.5, 200, 0.5, 'Ah'), 'data-dep')}
+    ${UPS_ROW('允许放电深度', '铅酸一般 80~85%，深循环可到 100%', upsNum('battery_dod', 30, 100, 1, '%'), 'data-dep')}
     <div class="set-sub">告警（走 设置 → 通知 的渠道）</div>
-    ${UPS_ROW('启用告警', '总开关。关掉后事件仍记录，只是不发通知', `<button class="switch" type="button" role="switch" aria-checked="false" data-k="notify_enabled" aria-label="启用告警"></button>`, 'data-dep')}
+    <div class="set-row" data-dep><div><div class="lbl">通知方式</div><div class="hint">事件发到哪几个通道；都不选就不发，事件仍记录在「事件记录」里</div></div><div class="ctl" data-ref="route"></div></div>
     <div class="set-row block" data-dep><div><div class="lbl">告警事件</div><div class="hint">「严重」级别不受静默时段约束</div></div>
       <div class="ctl up-evs" data-ref="evs">${EV.map(([k, l]) => `<button class="btn sm" type="button" data-ev="${k}" aria-pressed="false">${l}</button>`).join('')}</div></div>
     ${UPS_ROW('同类事件去抖', '同一类事件在该窗口内只发一次', upsNum('notify_debounce_s', 0, 3600, 10, '秒'))}
@@ -233,11 +233,30 @@ function renderUps(card) {
       if (!j.ok) throw new Error(j.error || '未知错误');
       toast('已保存 · ' + label, { key: 'save' });
       Poll.run('ups'); Poll.run('upsguard');
+      card._sync();
+      return true;
     } catch (e) {
       toast('保存失败 · ' + label + '：' + String(e.message).slice(0, 90), { icon: 'alert', ms: 6000 });
+      card._sync();
+      return false;
     }
-    card._sync();
   };
+  // 通知方式：本地镜像 + 立刻保存。为空表示这个功能不发通知（notify_enabled 一起归零）
+  let upsCh = null;
+  const upsRoute = () => {
+    if (upsCh !== null) return upsCh;
+    const c = cfg();
+    const on = c.notify_enabled === undefined ? true : !!+c.notify_enabled;
+    return on ? notifyRouteGet('ups') : [];
+  };
+  const routeEl = notifyRouteCtl(upsRoute, v => {
+    upsCh = v;
+    save({ notify_channels: v, notify_enabled: v.length ? 1 : 0 }, '通知方式').then(ok => {
+      if (!ok) upsCh = null;
+      card._sync();
+    });
+  });
+  if (x.route) x.route.append(routeEl);
   const readK = el => {
     if (el.classList.contains('switch')) return el.getAttribute('aria-checked') === 'true' ? 1 : 0;
     if (el.dataset.k === 'notify_quiet' || el.dataset.k === 'ups_name') return el.value.trim();
@@ -308,6 +327,7 @@ function renderUps(card) {
     $$('[data-dep]', card).forEach(el => { el.hidden = !on; });
     $$('[data-gdep]', card).forEach(el => { el.hidden = !g; });
     $$('.set-sub', card).forEach(el => { el.hidden = !on; });
+    if (upsCh === null) routeEl.sync();
     $$('[data-k]', card).forEach(el => {
       const k = el.dataset.k, v = c[k];
       if (el.classList.contains('switch')) el.setAttribute('aria-checked', String(!!+v));

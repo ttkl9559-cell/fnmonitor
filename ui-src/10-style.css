@@ -691,13 +691,20 @@ a { color: var(--accent); text-decoration: none; }
 /* =====================================================================
    14. FLOATING: toast / popover / palette / shortcuts
    ===================================================================== */
-.toasts { position: fixed; z-index: 90; left: 50%; bottom: 28px; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 8px; pointer-events: none; }
-.toast { display: flex; align-items: center; gap: 10px; padding: 10px 12px 10px 14px; border-radius: var(--r-pill); background: var(--ink-1); color: var(--ink-inv); font-size: 14px; font-weight: 500; box-shadow: 0 12px 32px -8px rgba(0,0,0,.35); pointer-events: auto; animation: toastIn var(--dur-3) var(--ease); white-space: nowrap; }
+.toasts { position: fixed; z-index: 95; left: 50%; top: calc(64px + 10px); transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 8px; pointer-events: none; }
+.toast { display: flex; align-items: center; gap: 10px; padding: 10px 12px 10px 14px; border-radius: var(--r-pill); background: var(--ink-1); color: var(--ink-inv); font-size: 14px; font-weight: 500; box-shadow: 0 12px 32px -8px rgba(0,0,0,.35); pointer-events: auto; animation: toastDown var(--dur-3) var(--ease); white-space: nowrap; }
+/* 三种结果色：绿=已保存、红=失败、墨=普通信息。都取固定深色，白字在深浅主题下都够对比 */
+.toast[data-tone="ok"] { background: #0E7A44; color: #fff; }
+.toast[data-tone="err"] { background: #C2272D; color: #fff; }
+.toast[data-tone="ok"] .i.ok, .toast[data-tone="err"] .i, [data-theme="dark"] .toast[data-tone="ok"] .i.ok { color: #fff; }
+.toast[data-tone="ok"] button, .toast[data-tone="err"] button { background: rgba(255,255,255,.2); color: #fff; }
 .toast .i { width: 16px; height: 16px; stroke-width: 2.2; }
 .toast .i.ok { color: #7CD6A2; } [data-theme="dark"] .toast .i.ok { color: var(--ok); }
 .toast button { height: 26px; padding: 0 10px; border-radius: var(--r-pill); background: rgba(255,255,255,.14); font-size: 13px; font-weight: 600; }
 [data-theme="dark"] .toast button { background: rgba(0,0,0,.08); }
-.toast.out { animation: toastOut var(--dur-2) var(--ease) forwards; }
+.toast.out { animation: toastUp var(--dur-2) var(--ease) forwards; }
+@keyframes toastDown { from { opacity: 0; transform: translateY(-12px) scale(.97); } to { opacity: 1; transform: none; } }
+@keyframes toastUp { to { opacity: 0; transform: translateY(-6px) scale(.98); } }
 @keyframes toastIn { from { opacity: 0; transform: translateY(12px) scale(.97); } to { opacity: 1; transform: none; } }
 @keyframes toastOut { to { opacity: 0; transform: translateY(6px) scale(.98); } }
 .popover { position: absolute; z-index: 80; width: 280px; padding: 14px 16px; border-radius: 14px; background: var(--card); box-shadow: var(--shadow-pop); font-size: var(--fs-sm); color: var(--ink-2); line-height: 1.65; animation: toastIn var(--dur-2) var(--ease); }
@@ -825,7 +832,7 @@ body:not(.editing) .module.off { display: none; }
   .sheet-hero .num { font-size: 52px; }
   .sheet-body { padding: 0 var(--s4) calc(var(--s8) + env(safe-area-inset-bottom)); }
   .tbl .hide-m { display: none; }
-  .toasts { bottom: calc(86px + env(safe-area-inset-bottom)); }
+  .toasts { top: calc(56px + 8px); }
   .editbar { bottom: calc(84px + env(safe-area-inset-bottom)); padding-left: 16px; gap: 10px; }
   .editbar small { display: none; }
   .bottom-nav { display: flex; position: fixed; z-index: 42; left: 0; right: 0; bottom: 0; padding: 6px 12px calc(6px + env(safe-area-inset-bottom)); background: var(--bg-bar); -webkit-backdrop-filter: saturate(1.6) blur(18px); backdrop-filter: saturate(1.6) blur(18px); border-top: 1px solid var(--line); justify-content: space-around; }

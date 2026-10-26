@@ -20,7 +20,7 @@ async function saveCfg(data, label, row, quiet) {
     if (!j || !j.ok) throw new Error((j && j.error) || '未知错误');
     if (j.config) Object.assign(S.cfg, stripSecrets(j.config));
     Object.keys(data).forEach(k => { if (!SECRET_KEYS.includes(k) && S.cfg[k] === undefined) S.cfg[k] = data[k]; });
-    flashRow(row); if (!quiet) toast(j.note ? `已保存 · ${label}。${j.note}` : `已保存 · ${label}`, { key: 'save', ms: j.note ? 9000 : 2400 });
+    flashRow(row); if (!quiet) toast(j.note ? `已保存 · ${label}。${j.note}` : `已保存 · ${label}`, { key: 'save', ms: j.note ? 9000 : 2000 });
     applyConfig(); syncSettings();
     return j;
   } catch (e) {
@@ -70,6 +70,7 @@ function controlFor(it, row) {
     row.classList.add('inline'); b.sync(); return b;
   }
   if (it.type === 'seg') { const s = makeSeg(it.options, it.get(), v => it.set(v, row), 'sm'); s.sync = () => { const v = it.get(); if (String(v) !== String(s.value)) s.set(v); }; return s; }
+  if (it.type === 'route') return notifyRouteCtl(it.get, v => it.set(v, row));
   if (it.type === 'number') return numField(it, row);
   if (it.type === 'text') {
     const el = mount(`<span class="txt-ctl"><input class="textfield ${it.mono ? 'mono' : ''}" placeholder="${esc(it.placeholder || '')}" aria-label="${esc(it.label)}" spellcheck="false"><button class="btn" type="button" data-ref="save">保存</button>${it.cancel ? '<button class="btn ghost" type="button" data-ref="cancel" hidden>取消</button>' : ''}</span>`);
@@ -158,6 +159,10 @@ const SET_SCHEMA = [
     cfgToggle('disk_standby_protect', '休眠硬盘保护', { hint: '不唤醒已停转的硬盘', help: '开启后跳过休眠硬盘的容量 / SMART / 温度读取，避免把它唤醒；历史在硬盘醒来后补写。关闭则每个周期完整采集，硬盘可能无法进入休眠。' }),
     cfgToggle('disk_scan_enabled', '硬盘巡检', { hint: '定时全盘读取 SMART 并分级，盘位卡片的健康状态来自这里', help: '巡检在后台按固定周期执行：全盘 smartctl → 红黄绿分级 → 存入本机数据库，盘位卡片只读这份结果，打开页面不会再逐盘读取。关闭后不再巡检，盘位显示「未巡检」。休眠中的硬盘会被跳过（带 -n standby，不会唤醒），沿用上次结论。' }),
     cfgItem('disk_scan_interval_h', '巡检间隔', 'seg', { options: [[6, '6 小时'], [12, '12 小时'], [24, '24 小时'], [72, '3 天'], [168, '7 天']], hint: '间隔越短发现退化越及时，读取次数也越多；14 块盘一轮约 15–20 秒' }),
+    { k: 'diskNotify', label: '通知方式', type: 'route',
+      get: () => notifyRouteGet('disk'),
+      set: (v, row) => saveNotifyRoute('disk', v, row),
+      hint: () => '巡检发现新增故障 / 加重 / 恢复时发到哪；都不选就不发，变动仍记在巡检历史里' },
     { k: 'diskScanNow', label: '立即巡检', type: 'action', button: '现在巡检一次',
       hint: '不等下一个周期，立刻跑一轮全盘 SMART 并更新盘位分级；换盘或刚装完想马上看到结果时用',
       run: async b => {
@@ -177,8 +182,8 @@ const SET_SCHEMA = [
   { id: 'ups', title: 'UPS 电源', icon: 'battery',
     desc: '接在 NAS 上的 UPS（经 NUT 读取）：实时读数、电池健康、历史曲线、断电告警与关机保护。启用后顶部导航会出现「电源」页；未启用时不读 UPS、不记历史、不发通知。',
     custom: renderUps },
-  { id: 'notify', title: '通知', icon: 'bell', desc: '硬盘巡检发现故障变化时，把消息推送到邮箱或微信；两个通道各自独立，测试也各测各的。', custom: renderNotify },
-  { id: 'idrac', title: 'iDRAC', icon: 'server', desc: '戴尔服务器带外管理：直连 iDRAC 读风扇转速、温度、功耗与硬件日志（只读，不改服务器任何设置）。', custom: renderIdrac },
+  { id: 'notify', title: '通知', icon: 'bell', desc: '只配「怎么发」：邮件与微信（Server酱）两个通道，各自填账号、各自开关。哪件事要通知、发到哪个通道，在硬盘巡检 / iDRAC / UPS 各自的设置里选。', custom: renderNotify },
+  { id: 'idrac', title: 'iDRAC', icon: 'server', desc: '戴尔服务器带外管理：直连 iDRAC 读风扇转速、温度、功耗与硬件日志（只读，不改服务器任何设置）。未启用时这里只留一行开关。', custom: renderIdrac },
   { id: 'ignored', title: '已忽略的提醒', icon: 'eye-off', desc: '在 健康检查 中忽略的问题会列在这里：不计入健康分与首页结论；问题状态发生变化（如重映射扇区数增加、级别从留意升为严重、未运行的容器变化）时会自动重新提醒。', custom: renderIgnored },
   { id: 'look', title: '外观', icon: 'palette', items: [
     uiItem('theme', '外观模式', 'seg', { options: [['light', '浅色'], ['dark', '深色'], ['auto', '跟随系统']] }),
@@ -353,10 +358,64 @@ async function loadNotify(force) {
   catch (e) { NB = Object.assign({}, NB || {}, { load_error: e.message || '读取失败' }); }
   return NB;
 }
+/* ---- 通知方式：每个会发消息的功能自己选发到哪几个通道 ----
+   通道本身（邮箱、SendKey、开关）只在「设置 → 通知」里配一次；这里只决定
+   「这件事要不要发、发哪个渠道」。都不选 = 该功能不发通知。 */
+const N_CH = [['mail', '邮件'], ['sct', '微信']];
+const N_CH_LABEL = { mail: '邮件', sct: '微信' };
+function notifyRouteCtl(get, set) {
+  const el = mount(`<div class="nroute" role="group" aria-label="通知方式">${
+    N_CH.map(([c, l]) => `<button class="btn sm" type="button" data-ch="${c}" aria-pressed="false">${l}</button>`).join('')
+  }<span class="nr-note" data-ref="note"></span></div>`);
+  let cur = [];
+  const paint = () => {
+    const on = new Set(cur);
+    $$('[data-ch]', el).forEach(b => b.setAttribute('aria-pressed', String(on.has(b.dataset.ch))));
+    const chs = (NB || {}).channels || [];
+    const dead = cur.filter(c => { const x = chs.find(y => y.id === c); return !!x && !x.on; });
+    const note = el._r.note;
+    if (!cur.length) setText(note, '不发通知');
+    else if (dead.length) setText(note, dead.map(c => N_CH_LABEL[c] || c).join('、') + ' 通道未在上方启用，选了也发不出去');
+    else setText(note, '');
+    note.hidden = !note.textContent;
+  };
+  el.sync = () => { cur = (get() || []).filter(c => N_CH.some(([x]) => x === c)); paint(); };
+  el.addEventListener('click', e => {
+    const b = e.target.closest('[data-ch]'); if (!b) return;
+    const s = new Set(cur);
+    s.has(b.dataset.ch) ? s.delete(b.dataset.ch) : s.add(b.dataset.ch);
+    cur = N_CH.map(([c]) => c).filter(c => s.has(c));
+    paint();
+    if (set) set(cur.slice());
+  });
+  el.sync();
+  return el;
+}
+/** 存某个功能的通知方式；成功后刷新本地缓存并重绘（通道未启用提示要跟着变） */
+async function saveNotifyRoute(feature, channels, row) {
+  try {
+    const j = await API.post('/api/notify/route', { feature, channels });
+    if (!j || !j.ok) throw new Error((j && j.error) || '未知错误');
+    NB = Object.assign(NB || {}, j.notify || {});
+    flashRow(row);
+    toast('已保存 · 通知方式' + (channels && channels.length ? '' : '（该功能不再发通知）'), { key: 'save' });
+    syncSettings();
+    return j;
+  } catch (e) {
+    toast('保存失败 · 通知方式：' + String(e.message).slice(0, 80), { icon: 'alert', ms: 5000 });
+    syncSettings();
+    return null;
+  }
+}
+/** 读当前路由（未加载完成时先按「两个都选」兜底，加载完 syncSettings 会纠正） */
+const notifyRouteGet = feature => {
+  const r = (NB || {}).routes;
+  if (!r) return N_CH.map(([c]) => c);
+  return (r[feature] || []).slice();
+};
 function renderNotify(card) {
-  card.innerHTML = `<div class="note info notify-note">${ic('bell')}<span><b>两条独立的告警线，可分别开关</b>：<br>
-· <b>硬盘巡检</b>：新增故障 / 加重 / 已恢复各发一条，同一块盘的同一状态只发一次，发送失败下一轮巡检自动重试（跟着「硬盘巡检」走，需先在 网络与硬盘 里打开巡检）；<br>
-· <b>硬件告警</b>：iDRAC 的 SEL 硬件日志与风扇 / 温度 / 电源，攒到每天指定时刻统一发一封，<b>到点前已经恢复的整条不发</b>，一直没恢复的每 7 天再提醒，正文带发生时间。</span></div>
+  card.innerHTML = `<div class="note info notify-note">${ic('bell')}<span><b>这里只配置「怎么发」</b>：邮件与微信（Server酱）两个通道，各自填账号、各自开关，填完点下面的「保存」。<br>
+至于<b>哪件事要通知、发到哪个通道</b>，在各功能自己的设置里选：<b>网络与硬盘 → 通知方式</b>、<b>iDRAC → 通知方式</b>、<b>UPS 电源 → 通知方式</b>。那里一个都不选，该功能就不发通知。</span></div>
     <div class="set-row inline"><div><div class="lbl">邮件通知</div><div class="hint" data-ref="hMail"></div></div><div class="ctl"><span class="test-msg" data-ref="mMail"></span><button class="btn" type="button" data-ref="tMail">发送测试</button><button class="switch" type="button" role="switch" aria-checked="false" data-ref="swMail" aria-label="邮件通知"></button></div></div>
     <div class="set-row"><div><div class="lbl">邮箱服务商</div><div class="hint">选择后自动填入服务器、端口与加密方式</div></div><div class="ctl" data-ref="segP"></div></div>
     <div class="set-row"><div><div class="lbl">服务器与端口</div><div class="hint">QQ / 163 等需在邮箱网页端开启 SMTP 服务</div></div><div class="ctl" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><input class="textfield mono" style="width:190px" data-ref="host" placeholder="smtp.qq.com" spellcheck="false" aria-label="SMTP 服务器"><input class="textfield mono" style="width:86px" type="number" min="1" max="65535" data-ref="port" aria-label="SMTP 端口"><span data-ref="segSec"></span></div></div>
@@ -365,12 +424,10 @@ function renderNotify(card) {
     <div class="set-row"><div><div class="lbl">收件人</div><div class="hint">多个地址用英文逗号分隔</div></div><div class="ctl"><input class="textfield" data-ref="to" placeholder="you@qq.com" spellcheck="false" aria-label="收件人"></div></div>
     <div class="set-row inline"><div><div class="lbl">微信通知（Server酱）</div><div class="hint">sct.ftqq.com 注册并关注「方糖」服务号后复制 SendKey；免费版每天 5 条</div></div><div class="ctl"><span class="test-msg" data-ref="mSct"></span><button class="btn" type="button" data-ref="tSct">发送测试</button><button class="switch" type="button" role="switch" aria-checked="false" data-ref="swSct" aria-label="微信通知"></button></div></div>
     <div class="set-row"><div><div class="lbl">SendKey</div><div class="hint" data-ref="hKey"></div></div><div class="ctl"><input class="textfield mono" type="password" data-ref="sctkey" placeholder="SCT…" autocomplete="new-password" aria-label="SendKey"></div></div>
-    <div class="set-row inline"><div><div class="lbl">硬件告警</div><div class="hint" data-ref="hHw"></div></div><div class="ctl"><button class="switch" type="button" role="switch" aria-checked="false" data-ref="swHw" aria-label="硬件告警"></button></div></div>
-    <div class="set-row"><div><div class="lbl">硬件告警发送时间</div><div class="hint">每天到这个时刻汇总发一封：只发仍未恢复的，正文带发生时间；持续没恢复的每 7 天再提醒一次，通知过又恢复的补一封「已恢复」</div></div><div class="ctl"><input class="textfield mono" style="width:110px" type="time" data-ref="hwTime" aria-label="硬件告警发送时间"></div></div>
     <div class="set-row"><div><div class="lbl">保存设置</div><div class="hint" data-ref="hMsg"></div></div><div class="ctl"><button class="btn primary" type="button" data-ref="save">保存</button></div></div>`;
   const x = collect(card);
   const f = { enabled: 0, provider: 'qq', host: '', port: 465, secure: 'ssl', user: '', to: '',
-              password: '', sct_enabled: 0, sct_key: '', hw_enabled: 0, hw_time: '08:00' };
+              password: '', sct_enabled: 0, sct_key: '' };
   const segP = makeSeg(NOTIFY_PROVIDERS.map(p => [p[0], p[1]]), 'qq', v => {
     f.provider = v;
     const pv = NOTIFY_PROVIDERS.find(p => p[0] === v);
@@ -380,42 +437,38 @@ function renderNotify(card) {
   x.segP.append(segP); x.segSec.append(segSec);
   const bind = (el, k, num) => el.addEventListener('input', () => { f[k] = num ? (parseInt(el.value, 10) || 0) : el.value; });
   bind(x.host, 'host'); bind(x.port, 'port', true); bind(x.user, 'user'); bind(x.to, 'to');
-  bind(x.pw, 'password'); bind(x.sctkey, 'sct_key'); bind(x.hwTime, 'hw_time');
+  bind(x.pw, 'password'); bind(x.sctkey, 'sct_key');
   const setSw = (el, k) => el.addEventListener('click', () => {
     const on = el.getAttribute('aria-checked') !== 'true';
     el.setAttribute('aria-checked', String(on)); f[k] = on ? 1 : 0; sync();
   });
-  setSw(x.swMail, 'enabled'); setSw(x.swSct, 'sct_enabled'); setSw(x.swHw, 'hw_enabled');
+  setSw(x.swMail, 'enabled'); setSw(x.swSct, 'sct_enabled');
   const stamp = ts => { try { return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }); } catch (e) { return ''; } };
   function sync() {
     const n = NB || {};
     x.swMail.setAttribute('aria-checked', String(!!+f.enabled));
     x.swSct.setAttribute('aria-checked', String(!!+f.sct_enabled));
-    x.swHw.setAttribute('aria-checked', String(!!+f.hw_enabled));
     segP.set(f.provider); segSec.set(f.secure);
     if (document.activeElement !== x.host) x.host.value = f.host || '';
     if (document.activeElement !== x.port) x.port.value = f.port || 465;
     if (document.activeElement !== x.user) x.user.value = f.user || '';
     if (document.activeElement !== x.to) x.to.value = f.to || '';
-    if (document.activeElement !== x.hwTime) x.hwTime.value = f.hw_time || '08:00';
     x.pw.placeholder = n.password_set ? '已保存 · 留空不修改' : '邮箱授权码';
     x.sctkey.placeholder = n.sct_key_set ? '已保存 · 留空不修改' : 'SCT 开头的 SendKey';
-    setText(x.hMail, +f.enabled ? (+f.enabled && n.password_set && f.user && f.to ? '已开启：巡检发现变化时发邮件' : '已开启，保存前请补全账号、授权码与收件人') : '关闭：只做巡检，不发消息');
+    setText(x.hMail, +f.enabled
+      ? (n.password_set && f.user && f.to ? '已开启：选了「邮件」的功能会发到这个邮箱' : '已开启，保存前请补全账号、授权码与收件人')
+      : '关闭：所有功能都发不出邮件');
     setText(x.hPw, n.password_set ? '已保存过授权码，留空表示不修改' : '邮箱网页端「账户 → POP3/SMTP」开启后生成的授权码，不是登录密码');
     setText(x.hKey, n.sct_key_set ? '已保存过 SendKey，留空表示不修改' : '服务酱 SendKey，可在 sct.ftqq.com 的 SendKey 页复制');
-    setText(x.hHw, +f.hw_enabled
-      ? `已开启：每天 ${f.hw_time || '08:00'} 汇总发一封，只发到点仍未恢复的`
-      : '关闭：SEL 硬件日志与风扇 / 温度 / 电源不推送（硬盘巡检仍按上面的开关走）');
     const last = n.last || {};
     setText(x.hMsg, n.load_error ? '读取配置失败：' + n.load_error : last.ts
       ? `上次推送 ${stamp(last.ts)} · ${last.ok ? '成功' : '失败：' + ((last.channels && Object.values(last.channels).filter(c => c && !c.ok).map(c => c.err).join('；')) || '未知错误')}`
-      : '还没有推送记录：状态变化时才发消息。想现在确认配置可用，先「保存」再点上方对应通道的「发送测试」');
+      : '还没有推送记录：状态变化时才发消息。想现在确认通道可用，先「保存」再点上方对应通道的「发送测试」');
   }
   async function doSave() {
     x.save.disabled = true;
     const body = { enabled: f.enabled, provider: f.provider, host: f.host, port: f.port, secure: f.secure,
-                   user: f.user, to: f.to, sct_enabled: f.sct_enabled,
-                   hw_enabled: f.hw_enabled, hw_time: f.hw_time || '08:00' };
+                   user: f.user, to: f.to, sct_enabled: f.sct_enabled };
     if (f.password) body.password = f.password;
     if (f.sct_key) body.sct_key = f.sct_key;
     try {
@@ -446,7 +499,7 @@ function renderNotify(card) {
   x.tMail.onclick = () => testOne('mail', x.tMail, x.mMail, '邮件');
   x.tSct.onclick = () => testOne('sct', x.tSct, x.mSct, '微信');
   card._sync = sync;
-  loadNotify().then(() => {
+  loadNotify(true).then(() => {
     const n = NB || {};
     Object.keys(f).forEach(k => { if (n[k] !== undefined && k !== 'password' && k !== 'sct_key') f[k] = n[k]; });
     f.password = ''; f.sct_key = '';
@@ -469,20 +522,23 @@ async function loadIdrac(opts) {
 }
 /** iDRAC：Redfish 只读接带外管理口，风扇 / 温度 / 功耗 / 硬件日志。 */
 function renderIdrac(card) {
-  card.innerHTML = `<div class="note info notify-note">${ic('server')}<span><b>只读</b>：通过 Redfish 直连 iDRAC 读取风扇转速、温度、功耗与硬件日志，不会改动服务器任何设置。密码单独存 <span class="mono">idrac.json</span>（0600），接口只回「是否已填」。自签证书需要关闭校验，仅建议在内网使用。</span></div>
+  card.innerHTML = `<div class="note info notify-note" data-dep>${ic('server')}<span><b>只读</b>：通过 Redfish 直连 iDRAC 读取风扇转速、温度、功耗与硬件日志，不会改动服务器任何设置。密码单独存 <span class="mono">idrac.json</span>（0600），接口只回「是否已填」。自签证书需要关闭校验，仅建议在内网使用。</span></div>
     <div class="set-row inline"><div><div class="lbl">iDRAC</div><div class="hint" data-ref="hOn"></div></div><div class="ctl"><button class="switch" type="button" role="switch" aria-checked="false" data-ref="swOn" aria-label="启用 iDRAC"></button></div></div>
-    <div class="set-row"><div><div class="lbl">地址</div><div class="hint">iDRAC 管理口 IP 或主机名，只填地址，不要带 https://</div></div><div class="ctl"><input class="textfield mono" data-ref="host" placeholder="192.168.1.120" spellcheck="false" aria-label="iDRAC 地址"></div></div>
-    <div class="set-row"><div><div class="lbl">用户名</div><div class="hint">建议在 iDRAC 里单建一个只读账号</div></div><div class="ctl"><input class="textfield" data-ref="user" placeholder="root" spellcheck="false" autocomplete="username" aria-label="iDRAC 用户名"></div></div>
-    <div class="set-row"><div><div class="lbl">密码</div><div class="hint" data-ref="hPw"></div></div><div class="ctl"><input class="textfield" type="password" data-ref="pw" placeholder="iDRAC 登录密码" autocomplete="new-password" aria-label="iDRAC 密码"></div></div>
-    <div class="set-row inline"><div><div class="lbl">跳过证书校验</div><div class="hint">iDRAC 出厂是自签证书，内网访问需要关闭校验</div></div><div class="ctl"><button class="switch" type="button" role="switch" aria-checked="true" data-ref="swTls" aria-label="跳过证书校验"></button></div></div>
-    <div class="set-row inline"><div><div class="lbl">硬件日志纳入告警</div><div class="hint">SEL 出现新的 Critical / Warning 时，跟硬盘告警一起推送</div></div><div class="ctl"><button class="switch" type="button" role="switch" aria-checked="true" data-ref="swSel" aria-label="硬件日志纳入告警"></button></div></div>
-    <div class="set-row"><div><div class="lbl">连接与保存</div><div class="hint" data-ref="hMsg"></div></div><div class="ctl" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="btn" type="button" data-ref="test">测试连接</button><button class="btn primary" type="button" data-ref="save">保存</button></div></div>
-    <div class="set-row inline"><div><div class="lbl">固定信息</div><div class="hint" data-ref="hStatic">槽位 / 内存 / 阵列卡 / 物理盘 / 卷只在首次连接时读一次，之后不再自动刷新</div></div><div class="ctl"><button class="btn" type="button" data-ref="refresh">刷新固定信息</button></div></div>
-    <div class="idrac-live" data-ref="live"></div>`;
+    <div class="set-row" data-dep><div><div class="lbl">地址</div><div class="hint">iDRAC 管理口 IP 或主机名，只填地址，不要带 https://</div></div><div class="ctl"><input class="textfield mono" data-ref="host" placeholder="192.168.1.120" spellcheck="false" aria-label="iDRAC 地址"></div></div>
+    <div class="set-row" data-dep><div><div class="lbl">用户名</div><div class="hint">建议在 iDRAC 里单建一个只读账号</div></div><div class="ctl"><input class="textfield" data-ref="user" placeholder="root" spellcheck="false" autocomplete="username" aria-label="iDRAC 用户名"></div></div>
+    <div class="set-row" data-dep><div><div class="lbl">密码</div><div class="hint" data-ref="hPw"></div></div><div class="ctl"><input class="textfield" type="password" data-ref="pw" placeholder="iDRAC 登录密码" autocomplete="new-password" aria-label="iDRAC 密码"></div></div>
+    <div class="set-row inline" data-dep><div><div class="lbl">跳过证书校验</div><div class="hint">iDRAC 出厂是自签证书，内网访问需要关闭校验</div></div><div class="ctl"><button class="switch" type="button" role="switch" aria-checked="true" data-ref="swTls" aria-label="跳过证书校验"></button></div></div>
+    <div class="set-sub" data-dep>硬件告警（走 设置 → 通知 的渠道）</div>
+    <div class="set-row inline" data-dep><div><div class="lbl">硬件日志纳入告警</div><div class="hint">SEL 出现新的 Critical / Warning 时一并推送</div></div><div class="ctl"><button class="switch" type="button" role="switch" aria-checked="true" data-ref="swSel" aria-label="硬件日志纳入告警"></button></div></div>
+    <div class="set-row" data-dep><div><div class="lbl">通知方式</div><div class="hint">SEL 硬件日志与风扇 / 温度 / 电源有异常时发到哪；都不选就不推送</div></div><div class="ctl" data-ref="route"></div></div>
+    <div class="set-row" data-dep><div><div class="lbl">告警发送时间</div><div class="hint">每天到这个时刻汇总发一封：只发仍未恢复的；一直没恢复的每 7 天再提醒，期间恢复了补一封「已恢复」</div></div><div class="ctl"><input class="textfield mono" style="width:110px" type="time" data-ref="hwTime" aria-label="告警发送时间"></div></div>
+    <div class="set-row" data-dep><div><div class="lbl">连接与保存</div><div class="hint" data-ref="hMsg"></div></div><div class="ctl" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="btn" type="button" data-ref="test">测试连接</button><button class="btn primary" type="button" data-ref="save">保存</button></div></div>
+    <div class="set-row inline" data-dep><div><div class="lbl">固定信息</div><div class="hint" data-ref="hStatic">槽位 / 内存 / 阵列卡 / 物理盘 / 卷只在首次连接时读一次，之后不再自动刷新</div></div><div class="ctl"><button class="btn" type="button" data-ref="refresh">刷新固定信息</button></div></div>
+    <div class="idrac-live" data-ref="live" data-dep></div>`;
   const x = collect(card);
-  const f = { enabled: 0, host: '', user: '', password: '', verify_tls: 0, sel_alert: 1 };
+  const f = { enabled: 0, host: '', user: '', password: '', verify_tls: 0, sel_alert: 1, hw_time: '08:00' };
   const bind = (el, k) => el.addEventListener('input', () => { f[k] = el.value; });
-  bind(x.host, 'host'); bind(x.user, 'user'); bind(x.pw, 'password');
+  bind(x.host, 'host'); bind(x.user, 'user'); bind(x.pw, 'password'); bind(x.hwTime, 'hw_time');
   const setSw = (el, k, invert) => el.addEventListener('click', () => {
     const on = el.getAttribute('aria-checked') !== 'true';
     el.setAttribute('aria-checked', String(on));
@@ -490,6 +546,12 @@ function renderIdrac(card) {
     sync();
   });
   setSw(x.swOn, 'enabled'); setSw(x.swTls, 'verify_tls', true); setSw(x.swSel, 'sel_alert');
+  // 通知方式跟「保存」一起提交；null = 还没动过，显示服务端的值
+  let hwCh = null;
+  const routeEl = notifyRouteCtl(() => (hwCh === null ? notifyRouteGet('hw') : hwCh), v => { hwCh = v; });
+  x.route.append(routeEl);
+  // 时刻：idrac.json 没设过就沿用 notify.json 里的老值，再没有就 08:00
+  const hwTimeEff = () => f.hw_time || (NB && NB.hw_time) || '08:00';
   const hcls = h => /crit/i.test(h) ? 'h-crit' : /warn/i.test(h) ? 'h-warn' : 'h-ok';
   const when = s => { try { return new Date(s).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch (e) { return String(s || ''); } };
   function renderLive() {
@@ -570,6 +632,11 @@ function renderIdrac(card) {
   }
   function sync() {
     const n = (IB && IB.config) || {};
+    // 未启用时整页只留「启用」那一行：其余设置项全部收起来
+    const on = !!+f.enabled;
+    $$('[data-dep]', card).forEach(el => { el.hidden = !on; });
+    if (hwCh === null) routeEl.sync();
+    if (document.activeElement !== x.hwTime) x.hwTime.value = hwTimeEff();
     x.swOn.setAttribute('aria-checked', String(!!+f.enabled));
     x.swTls.setAttribute('aria-checked', String(!+f.verify_tls));
     x.swSel.setAttribute('aria-checked', String(!!+f.sel_alert));
@@ -585,13 +652,16 @@ function renderIdrac(card) {
   }
   async function doSave() {
     x.save.disabled = true;
-    const body = { enabled: f.enabled, host: f.host, user: f.user, verify_tls: f.verify_tls, sel_alert: f.sel_alert };
+    const body = { enabled: f.enabled, host: f.host, user: f.user, verify_tls: f.verify_tls,
+                   sel_alert: f.sel_alert, hw_time: hwTimeEff(),
+                   notify_channels: (hwCh === null ? notifyRouteGet('hw') : hwCh) };
     if (f.password) body.password = f.password;
     try {
       const j = await API.post('/api/idrac/save', body);
       if (!j || !j.ok) throw new Error((j && j.error) || '未知错误');
       f.password = ''; x.pw.value = '';
       IB = await loadIdrac({ refresh: true });
+      hwCh = null; await loadNotify(true);
       toast('iDRAC 配置已保存', { key: 'save' }); flashRow(x.save.closest('.set-row'));
       setText(x.hMsg, (IB && IB.ok) ? '已保存并读取成功' : ('已保存 · ' + ((IB && IB.error) || '尚未读取到数据')));
     } catch (e) { toast('保存失败 · ' + String(e.message).slice(0, 80), { icon: 'alert', ms: 5000 }); }

@@ -866,7 +866,7 @@ class TestNotify(UpsTestBase):
     def test_success_marks_sent(self):
         self.enable_channel()
         with mock.patch.object(srv, "notify_send_all",
-                               lambda nc, s, b: (True, {"mail": {"ok": True}})):
+                               lambda nc, s, b, *a: (True, {"mail": {"ok": True}})):
             got = srv.ups_notify_after_poll([self.ev()], self.SNAP, self.cfg(), self.tmp)
         self.assertIn("市电中断", got)
         st = self.read_json("ups_state.json")
@@ -878,7 +878,7 @@ class TestNotify(UpsTestBase):
         self.enable_channel()
         calls = []
 
-        def boom(nc, s, b):
+        def boom(nc, s, b, *a):
             calls.append(s)
             return False, {"mail": {"ok": False, "err": "timeout"}}
 
@@ -903,7 +903,7 @@ class TestNotify(UpsTestBase):
         self.enable_channel()
         calls = []
         with mock.patch.object(srv, "notify_send_all",
-                               lambda nc, s, b: (calls.append(1), (False, {}))[1]):
+                               lambda nc, s, b, *a: (calls.append(1), (False, {}))[1]):
             srv.ups_notify_after_poll([self.ev()], self.SNAP, self.cfg(), self.tmp)
             n = len(calls)
             for _ in range(3):
@@ -919,7 +919,7 @@ class TestNotify(UpsTestBase):
                                                     "next_try": 0}],
                                        "last": None})
         with mock.patch.object(srv, "notify_send_all",
-                               lambda nc, s, b: (self.fail("不该再发"), (True, {}))[1]):
+                               lambda nc, s, b, *a: (self.fail("不该再发"), (True, {}))[1]):
             srv.ups_notify_after_poll([], self.SNAP, self.cfg(), self.tmp)
         self.assertEqual(self.read_json("ups_state.json")["pending"], [])
 

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -137,7 +138,7 @@ class NotifyStateTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _send(self, ok=True):
-        def fake(cfg, subject, body):
+        def fake(cfg, subject, body, *a, **kw):
             self.sent.append((subject, body))
             return ok, {"mail": {"ok": ok, "err": "" if ok else "认证失败"}}
         return mock.patch.object(srv, "notify_send_all", side_effect=fake)
@@ -620,3 +621,130 @@ class HwNotifyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NotifyRouteTest(unittest.TestCase):
+    """通知按功能路由：通道只在「通知」里配一次，每个功能自己选发到哪几个。"""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.dir = self._td.name
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def write_notify(self, obj):
+        with open(os.path.join(self.dir, srv.NOTIFY_FILE), "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    def on(self, **kw):
+        d = {"enabled": 1, "sct_enabled": 1, "user": "a@b.c", "password": "x",
+             "to": "a@b.c", "sct_key": "SCTx"}
+        d.update(kw)
+        return d
+
+    # ---- 归一与回落 ----
+    def test_default_routes(self):
+        cfg = srv.notify_load(self.dir)
+        self.assertEqual(cfg["routes"]["disk"], ["mail", "sct"])
+        self.assertEqual(cfg["routes"]["ups"], ["mail", "sct"])
+        self.assertEqual(cfg["routes"]["hw"], [])      # 硬件告警默认没开
+
+    def test_legacy_hw_enabled_keeps_route(self):
+        # 升级前只认 hw_enabled；升级后不能因为没写 routes 就把硬件告警关掉
+        self.write_notify({"hw_enabled": 1})
+        self.assertEqual(srv.notify_load(self.dir)["routes"]["hw"], ["mail", "sct"])
+
+    def test_bogus_channel_dropped(self):
+        self.write_notify(self.on(routes={"disk": ["mail", "bogus", "MAIL"]}))
+        self.assertEqual(srv.notify_load(self.dir)["routes"]["disk"], ["mail"])
+
+    def test_channels_filter_disabled(self):
+        self.write_notify(self.on(sct_enabled=0))
+        cfg = srv.notify_load(self.dir)
+        self.assertEqual(srv.notify_channels(cfg, "disk"), ["mail"])
+        self.assertEqual(srv.notify_channels(cfg), ["mail"])
+
+    def test_all_channels_off(self):
+        self.write_notify({"enabled": 0, "sct_enabled": 0})
+        for f in srv.NOTIFY_FEATURE_KEYS:
+            self.assertEqual(srv.notify_channels(srv.notify_load(self.dir), f), [])
+
+    # ---- 写路由 ----
+    def test_set_route_only_touches_one_feature(self):
+        self.write_notify(self.on())
+        cfg, err = srv.notify_set_route(self.dir, "ups", ["sct"])
+        self.assertEqual(err, "")
+        self.assertEqual(cfg["routes"]["ups"], ["sct"])
+        self.assertEqual(cfg["routes"]["disk"], ["mail", "sct"])
+        with open(os.path.join(self.dir, srv.NOTIFY_FILE), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["routes"]["ups"], ["sct"])
+
+    def test_set_route_syncs_legacy_hw_flag(self):
+        self.write_notify(self.on(hw_enabled=0))
+        srv.notify_set_route(self.dir, "hw", ["mail"])
+        with open(os.path.join(self.dir, srv.NOTIFY_FILE), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["hw_enabled"], 1)
+        srv.notify_set_route(self.dir, "hw", [])
+        with open(os.path.join(self.dir, srv.NOTIFY_FILE), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["hw_enabled"], 0)
+
+    def test_unknown_feature_rejected(self):
+        cfg, err = srv.notify_set_route(self.dir, "nope", ["mail"])
+        self.assertIn("未知", err)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, srv.NOTIFY_FILE)))
+
+    # ---- 发送 ----
+    def test_send_respects_route(self):
+        self.write_notify(self.on(routes={"disk": ["sct"], "ups": ["mail"], "hw": []}))
+        cfg = srv.notify_load(self.dir)
+        sent = []
+        with mock.patch.object(srv, "notify_mail_send",
+                               lambda c, s, b: (sent.append("mail"), (True, ""))[1]), \
+             mock.patch.object(srv, "notify_sct_send",
+                               lambda c, s, b: (sent.append("sct"), (True, ""))[1]):
+            srv.notify_send_all(cfg, "s", "b", "disk")
+            srv.notify_send_all(cfg, "s", "b", "ups")
+            srv.notify_send_all(cfg, "s", "b")          # 不传功能 = 所有启用通道
+        self.assertEqual(sent, ["sct", "mail", "mail", "sct"])
+
+    def test_no_channel_selected_is_not_a_failure(self):
+        # 用户没选 ≠ 发送失败：不能让它进 pending 无限重投
+        self.write_notify(self.on(routes={"disk": [], "ups": [], "hw": []}))
+        cfg = srv.notify_load(self.dir)
+        ok, res = srv.notify_send_all(cfg, "s", "b", "disk")
+        self.assertTrue(ok)
+        self.assertIn("skipped", res)
+
+    def test_send_failure_still_reported(self):
+        self.write_notify(self.on(routes={"disk": ["mail"], "ups": [], "hw": []}))
+        cfg = srv.notify_load(self.dir)
+        with mock.patch.object(srv, "notify_mail_send", lambda c, s, b: (False, "timed out")):
+            ok, res = srv.notify_send_all(cfg, "s", "b", "disk")
+        self.assertFalse(ok)
+        self.assertFalse(res["mail"]["ok"])
+
+    # ---- 各发送方的闸门 ----
+    def test_scan_silent_when_disk_has_no_channel(self):
+        self.write_notify(self.on(routes={"disk": [], "ups": ["mail"], "hw": []}))
+        self.assertIsNone(srv.notify_after_scan([disk("sda", "crit")], 1000, FakeDB(self.dir)))
+
+    def test_hw_gate_needs_route(self):
+        self.write_notify(self.on(hw_enabled=1, routes={"disk": [], "ups": [], "hw": []}))
+        srv._HW_CHECK_TS[0] = 0
+        now = time.mktime((2026, 10, 26, 23, 0, 0, 0, 1, -1))
+        self.assertFalse(srv._hw_due(self.dir, now))
+        srv.notify_set_route(self.dir, "hw", ["mail"])
+        srv._HW_CHECK_TS[0] = 0
+        self.assertTrue(srv._hw_due(self.dir, now))
+
+    # ---- 发送时刻的搬家与回落 ----
+    def test_hw_time_falls_back_to_notify_json(self):
+        self.write_notify({"hw_time": "21:30"})
+        self.assertEqual(srv.hw_time_resolve(self.dir), (21, 30))
+        with open(os.path.join(self.dir, srv.IDRAC_FILE), "w", encoding="utf-8") as f:
+            json.dump({"hw_time": "07:05"}, f)
+        self.assertEqual(srv.hw_time_resolve(self.dir), (7, 5))
+        with open(os.path.join(self.dir, srv.IDRAC_FILE), "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        self.assertEqual(srv.hw_time_resolve(self.dir), (21, 30))

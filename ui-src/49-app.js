@@ -257,7 +257,7 @@ route();
 setHash(false);
 requestAnimationFrame(() => placeThumb($('#pageSeg')));
 Poll.run('overview');
-Promise.all([loadUI(), loadConfig().catch(() => null)]).then(() => { syncSettings(); Poll.run('monthly'); Poll.run('weather'); });
+Promise.all([loadUI(), loadConfig().catch(() => null), loadNotify().catch(() => null)]).then(() => { syncSettings(); Poll.run('monthly'); Poll.run('weather'); });
 Poll.run('pstats'); Poll.run('traffic');
 seedSparks().catch(() => {});
 setInterval(() => Poll.tick(), 1000);

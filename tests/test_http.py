@@ -126,7 +126,9 @@ class NoAuthTest(ServerTestCase):
                   "/api/vm/action",
                   # UPS：含一个能真下发关机命令的入口，必须只接受 POST
                   "/api/ups/save", "/api/ups/guard/save", "/api/ups/guard/cancel",
-                  "/api/ups/guard/sim", "/api/ups/collect", "/api/ups/notify/test"):
+                  "/api/ups/guard/sim", "/api/ups/collect", "/api/ups/notify/test",
+                  # 通知按功能路由：改的是发送目标，只接受 POST
+                  "/api/notify/save", "/api/notify/test", "/api/notify/route"):
             st, j, r, _ = self.get(p)
             self.assertEqual((st, r.getheader("Allow")), (405, "POST"), p)
             self.assertEqual(j["error"], "method_not_allowed")
@@ -501,6 +503,66 @@ class UpsTest(ServerTestCase):
         j = self.get("/api/ups")[1]
         self.assertEqual((j["enabled"], j["state"]), (0, "off"))
         self.assertEqual(j["live"], {})
+
+
+class NotifyRouteTest(ServerTestCase):
+    """通知按功能路由：通道只在「通知」页配一次，功能侧只选发到哪几个通道。"""
+
+    def route(self, feature, channels, **kw):
+        return self.post("/api/notify/route", {"feature": feature, "channels": channels}, **kw)
+
+    def test_notify_shape_has_routes_channels_features(self):
+        st, j, *_ = self.get("/api/notify")
+        self.assertEqual(st, 200)
+        self.assertIsInstance(j["routes"], dict)
+        for f in ("disk", "ups", "hw"):
+            self.assertIn(f, j["routes"])
+            self.assertIsInstance(j["routes"][f], list)
+        ch = {c["id"]: c for c in j["channels"]}
+        self.assertEqual(set(ch), {"mail", "sct"})
+        for c in ch.values():
+            for k in ("id", "label", "on"):
+                self.assertIn(k, c)
+        feats = {f["id"]: f for f in j["features"]}
+        self.assertEqual(set(feats), {"disk", "ups", "hw"})
+        for f in feats.values():
+            for k in ("id", "label", "channels"):
+                self.assertIn(k, f)
+
+    def test_route_saves_and_reads_back(self):
+        before = self.get("/api/notify")[1]["routes"]
+        st, j, *_ = self.route("disk", ["mail"])
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"], j)
+        self.assertEqual(j["notify"]["routes"]["disk"], ["mail"])
+        # 只动这一个功能，别的功能不受影响
+        after = self.get("/api/notify")[1]["routes"]
+        self.assertEqual(after["ups"], before["ups"])
+        self.assertEqual(after["hw"], before["hw"])
+        self.route("disk", ["sct", "mail", "sct"])       # 去重 + 固定为「邮件 → 微信」顺序
+        self.assertEqual(self.get("/api/notify")[1]["routes"]["disk"], ["mail", "sct"])
+        self.route("disk", [])                          # 都不选 = 不发
+        self.assertEqual(self.get("/api/notify")[1]["routes"]["disk"], [])
+        self.route("disk", ["mail", "sct"])
+
+    def test_route_rejects_unknown_feature_and_drops_unknown_channel(self):
+        st, j, *_ = self.route("nope", ["mail"])
+        self.assertEqual(st, 200)
+        self.assertFalse(j["ok"])
+        self.assertTrue(j["error"])
+        st, j, *_ = self.route("notify", ["mail"])
+        self.assertEqual(st, 200)
+        self.assertFalse(j["ok"])
+        self.assertTrue(j["error"])
+        # 未知通道直接丢掉，不写进配置
+        self.route("ups", ["mail", "telegram"])
+        self.assertEqual(self.get("/api/notify")[1]["routes"]["ups"], ["mail"])
+
+    def test_route_requires_csrf_header(self):
+        st, j, _, _ = self.srv.request(
+            "POST", "/api/notify/route", {"feature": "disk", "channels": ["mail"]},
+            {"Content-Type": "application/json"})
+        self.assertEqual((st, j["error"]), (403, "csrf_rejected"))
 
 
 class AuthFlowTest(ServerTestCase):

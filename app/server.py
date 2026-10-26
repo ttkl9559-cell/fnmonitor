@@ -3505,6 +3505,20 @@ NOTIFY_DEFAULT = {"enabled": 0, "provider": "qq", "host": "smtp.qq.com", "port":
                   # 默认关闭，开启了也只在你指定的时刻统一发一封，恢复的不发、没恢复的才发
                   "hw_enabled": 0, "hw_time": "08:00"}
 NOTIFY_SECRET_KEYS = ("password", "sct_key")
+
+# 通知拆成两件互不相干的事：
+#   ① 「设置 → 通知」只配通道本身（邮件 / 微信 Server酱）——账号、授权码、收件人；
+#   ② 每个会发消息的功能自己选发到哪几个通道（routes），留空 = 该功能不发。
+# 这样加一个新功能只要往 NOTIFY_FEATURES 里加一行，不用再往通知页塞开关。
+NOTIFY_CHANNELS = (("mail", "邮件"), ("sct", "微信"))
+NOTIFY_FEATURES = (
+    ("disk", "硬盘巡检"),
+    ("ups", "UPS 电源"),
+    ("hw", "iDRAC 硬件告警"),
+)
+NOTIFY_FEATURE_KEYS = tuple(k for k, _ in NOTIFY_FEATURES)
+NOTIFY_ROUTE_DEFAULT = ("mail", "sct")
+NOTIFY_CHANNEL_LABEL = dict(NOTIFY_CHANNELS)
 GRADE_LABEL = {"ok": "正常", "warn": "留意", "crit": "故障", "unknown": "未知"}
 
 # 同一条硬件告警一直没恢复时，隔多久再提醒一次（天）
@@ -3525,9 +3539,67 @@ def notify_hw_time(cfg):
     return h, mi
 
 
+def notify_route_norm(raw):
+    """把一个通道列表归一成 ["mail","sct"] 的子集（去重、丢未知、按固定顺序）。"""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    seen = set(str(x).strip().lower() for x in raw)
+    return [c for c, _l in NOTIFY_CHANNELS if c in seen]
+
+
+def notify_routes(user, cfg=None):
+    """把 notify.json 里的 routes 归一成 {功能: [通道…]}，缺的功能按老配置语义回落。
+
+    老版本没有 routes：硬盘巡检与 UPS 一直是「所有启用通道都发」，硬件告警另有
+    hw_enabled 开关。所以缺 routes 时不能一律给满，得看 hw_enabled——
+    否则升级后一堆从没开过硬件告警的用户会突然开始收到告警邮件。
+    """
+    src = user if isinstance(user, dict) else {}
+    out = {}
+    for k, _label in NOTIFY_FEATURES:
+        if k not in src:
+            ch = list(NOTIFY_ROUTE_DEFAULT)
+            if k == "hw" and cfg is not None and not cfg.get("hw_enabled"):
+                ch = []
+            out[k] = ch
+            continue
+        out[k] = notify_route_norm(src[k])
+    return out
+
+
+def notify_channels(cfg, feature=None):
+    """该功能实际会用到的通道 = 功能选中的 ∩ 通道已启用的。返回 ["mail","sct"] 的子集。
+
+    feature 为 None 表示不按功能过滤（测试发信、老调用方）。
+    """
+    cfg = cfg or {}
+    if feature:
+        want = (cfg.get("routes") or {}).get(feature)
+        want = notify_route_norm(want) if want is not None else list(NOTIFY_ROUTE_DEFAULT)
+    else:
+        want = [c for c, _l in NOTIFY_CHANNELS]
+    on = {"mail": bool(cfg.get("enabled")), "sct": bool(cfg.get("sct_enabled"))}
+    return [c for c in want if on.get(c)]
+
+
+def hw_time_resolve(data_dir):
+    """硬件告警每天几点汇总发送：优先 idrac.json（新家），回落 notify.json（老位置）。"""
+    try:
+        icfg = idrac_load(data_dir or "")
+    except Exception:
+        icfg = {}
+    raw = str((icfg or {}).get("hw_time") or "").strip()
+    if not raw:
+        raw = str((notify_load(data_dir) or {}).get("hw_time") or "")
+    return notify_hw_time({"hw_time": raw})
+
+
 def notify_load(data_dir):
     """读 notify.json；缺字段回落默认值，格式错误不影响其余字段。"""
     cfg = dict(NOTIFY_DEFAULT)
+    cfg["routes"] = notify_routes(None, cfg)
     if not data_dir:
         return cfg
     try:
@@ -3556,6 +3628,7 @@ def notify_load(data_dir):
             pass
     if str(user.get("secure") or "").lower() in ("ssl", "starttls", "none"):
         cfg["secure"] = str(user["secure"]).lower()
+    cfg["routes"] = notify_routes(user.get("routes"), cfg)
     return cfg
 
 
@@ -3564,7 +3637,36 @@ def notify_public(cfg):
     out = {k: v for k, v in cfg.items() if k not in NOTIFY_SECRET_KEYS}
     out["password_set"] = bool(cfg.get("password"))
     out["sct_key_set"] = bool(cfg.get("sct_key"))
+    out["channels"] = [{"id": c, "label": l,
+                        "on": bool(cfg.get("enabled" if c == "mail" else "sct_enabled"))}
+                       for c, l in NOTIFY_CHANNELS]
+    out["features"] = [{"id": k, "label": l, "channels": notify_channels(cfg, k)}
+                       for k, l in NOTIFY_FEATURES]
     return out
+
+
+def notify_sync_legacy(cfg):
+    """把 routes 回写成老的 hw_enabled：降级回旧版本时硬件告警不会突然失灵/乱发。"""
+    cfg["hw_enabled"] = 1 if (cfg.get("routes") or {}).get("hw") else 0
+    return cfg
+
+
+def notify_set_route(data_dir, feature, channels):
+    """改某个功能「发到哪几个通道」，其余功能原样保留。返回 (最新配置, 错误)。"""
+    if feature not in NOTIFY_FEATURE_KEYS:
+        return notify_load(data_dir), "未知的通知功能：%s" % (feature or "空")
+    if not data_dir:
+        return notify_load(data_dir), "数据目录不可用"
+    cfg = notify_load(data_dir)
+    routes = dict(cfg.get("routes") or {})
+    routes[feature] = notify_route_norm(channels)
+    cfg["routes"] = notify_routes(routes, cfg)
+    notify_sync_legacy(cfg)
+    try:
+        write_json_secure(os.path.join(data_dir, NOTIFY_FILE), cfg)
+    except Exception as e:
+        return notify_load(data_dir), "写入通知配置失败：%s" % e
+    return notify_load(data_dir), ""
 
 
 def notify_save(data_dir, data, cur=None):
@@ -3608,6 +3710,14 @@ def notify_save(data_dir, data, cur=None):
         cfg["password"] = ""
     if data.get("clear_sct_key"):
         cfg["sct_key"] = ""
+    # 按功能选的通知方式：只覆盖传进来的功能，其余保持原样
+    if isinstance(data.get("routes"), dict):
+        merged = dict(cfg.get("routes") or {})
+        for k, _label in NOTIFY_FEATURES:
+            if k in data["routes"]:
+                merged[k] = notify_route_norm(data["routes"][k])
+        cfg["routes"] = notify_routes(merged, cfg)
+        notify_sync_legacy(cfg)
     if cfg.get("enabled"):
         miss = [name for name, ok in (("SMTP 服务器", cfg.get("host")), ("发件账号", cfg.get("user")),
                                       ("授权码", cfg.get("password")), ("收件人", cfg.get("to"))) if not ok]
@@ -3820,17 +3930,25 @@ def notify_state_load(data_dir):
         return {}
 
 
-def notify_send_all(cfg, subject, body):
-    """按已启用的通道发送，任一失败即视为失败（下一轮重试）。返回 (全部成功, 明细)。"""
+def notify_send_all(cfg, subject, body, feature=None):
+    """按「该功能选中的通道 ∩ 已启用的通道」发送。返回 (全部成功, 明细)。
+
+    任一通道失败即视为失败，调用方据此重投。一个通道都不用发时返回
+    (True, {"skipped": …})——「这个功能没选通知方式」不是发送失败，
+    当成失败会让它在 pending 队列里无限重试。
+    """
+    use = notify_channels(cfg, feature)
     res = {"mail": None, "sct": None}
+    if not use:
+        res["skipped"] = "未选择通知方式" if feature else "没有已启用的通知通道"
+        return True, res
     ok_all = True
-    if cfg.get("enabled"):
-        ok, err = notify_mail_send(cfg, subject, body)
-        res["mail"] = {"ok": ok, "err": "" if ok else notify_short_err(err)}
-        ok_all = ok_all and ok
-    if cfg.get("sct_enabled"):
-        ok, err = notify_sct_send(cfg, subject, body)
-        res["sct"] = {"ok": ok, "err": "" if ok else notify_short_err(err)}
+    for c in use:
+        if c == "mail":
+            ok, err = notify_mail_send(cfg, subject, body)
+        else:
+            ok, err = notify_sct_send(cfg, subject, body)
+        res[c] = {"ok": ok, "err": "" if ok else notify_short_err(err)}
         ok_all = ok_all and ok
     return ok_all, res
 
@@ -3932,7 +4050,7 @@ def notify_after_scan(items, ts, db, config=None):
         if not data_dir:
             return None
         cfg = notify_load(data_dir)
-        if not (cfg.get("enabled") or cfg.get("sct_enabled")):
+        if not notify_channels(cfg, "disk"):
             return None
         st = notify_state_load(data_dir)
         # 状态按序列号存：设备名跨重启会变，按名字存会导致同一块盘反复「新增」
@@ -4000,7 +4118,7 @@ def notify_after_scan(items, ts, db, config=None):
         except Exception:
             port = 8777
         subject, body = notify_build(events, ts, port)
-        ok, res = notify_send_all(cfg, subject, body)
+        ok, res = notify_send_all(cfg, subject, body, "disk")
         summary = {"ts": ts, "ok": ok, "subject": subject,
                    "acts": [e["act"] for e in events], "channels": res}
         if ok:
@@ -4158,16 +4276,15 @@ def notify_hw_tick(data_dir, config=None):
     """
     try:
         cfg = notify_load(data_dir)
-        if not cfg.get("hw_enabled"):
-            return None
-        if not (cfg.get("enabled") or cfg.get("sct_enabled")):
+        # hw_enabled 是老开关（保留做总闸），routes.hw 是「发到哪几个通道」
+        if not cfg.get("hw_enabled") or not notify_channels(cfg, "hw"):
             return None
         icfg = idrac_load(data_dir)
         if not (icfg.get("enabled") and icfg.get("host")):
             return None
         now = time.time()
         lt = time.localtime(now)
-        hh, mm = notify_hw_time(cfg)
+        hh, mm = hw_time_resolve(data_dir)
         if (lt.tm_hour, lt.tm_min) < (hh, mm):
             return None
         today = time.strftime("%Y-%m-%d", lt)
@@ -4215,7 +4332,7 @@ def notify_hw_tick(data_dir, config=None):
             except Exception:
                 port = 8777
             subject, body = notify_build(events, now, port)
-            ok, res = notify_send_all(cfg, subject, body)
+            ok, res = notify_send_all(cfg, subject, body, "hw")
             if ok:
                 for k in marked:
                     hw["active"][k]["sent"] = 1
@@ -4249,12 +4366,10 @@ def _hw_due(data_dir, now=None):
         return False
     _HW_CHECK_TS[0] = now
     cfg = notify_load(data_dir)
-    if not cfg.get("hw_enabled"):
-        return False
-    if not (cfg.get("enabled") or cfg.get("sct_enabled")):
+    if not cfg.get("hw_enabled") or not notify_channels(cfg, "hw"):
         return False
     lt = time.localtime(now)
-    hh, mm = notify_hw_time(cfg)
+    hh, mm = hw_time_resolve(data_dir)
     if (lt.tm_hour, lt.tm_min) < (hh, mm):
         return False
     hw = hw_state_load(data_dir)
@@ -4348,7 +4463,10 @@ _IDRAC_WAKE = threading.Event()
 _IDRAC_SLOW_WAKE = threading.Event()
 
 IDRAC_DEFAULT = {"enabled": 0, "host": "", "user": "", "password": "",
-                 "verify_tls": 0, "sel_alert": 1}
+                 "verify_tls": 0, "sel_alert": 1,
+                 # 硬件告警每天汇总发送的时刻。原先存在 notify.json 的 hw_time，
+                 # 为了让「通知页只管通道」，挪到 iDRAC 自己这边；空 = 沿用老位置
+                 "hw_time": ""}
 
 # iDRAC8 的 SEL 在 OEM 的 Logs 下，iDRAC9 走标准 LogServices；两个都试
 IDRAC_SEL_PATHS = ("/Managers/iDRAC.Embedded.1/LogServices/Sel/Entries",
@@ -4371,7 +4489,7 @@ def idrac_load(data_dir):
     for k in ("enabled", "verify_tls", "sel_alert"):
         if k in user:
             cfg[k] = onoff(user[k])
-    for k in ("host", "user", "password"):
+    for k in ("host", "user", "password", "hw_time"):
         if k in user:
             cfg[k] = str(user[k] or "")
     return cfg
@@ -4454,6 +4572,7 @@ def idrac_public(cfg):
             "user": cfg.get("user") or "",
             "verify_tls": cfg.get("verify_tls") or 0,
             "sel_alert": cfg.get("sel_alert") or 0,
+            "hw_time": cfg.get("hw_time") or "",
             "password_set": bool(str(cfg.get("password") or "").strip())}
 
 
@@ -4476,6 +4595,9 @@ def idrac_save(data_dir, data):
     for k in ("enabled", "verify_tls", "sel_alert"):
         if k in data:
             cfg[k] = onoff(data[k])
+    if "hw_time" in data:
+        hh, mm = notify_hw_time({"hw_time": data["hw_time"]})
+        cfg["hw_time"] = "%02d:%02d" % (hh, mm)
     if cfg["enabled"]:
         if not cfg["host"]:
             return cfg, "请填写 iDRAC 地址"
@@ -6293,8 +6415,9 @@ def ups_notify_after_poll(events, snap, cfg, data_dir, port=8777):
     if not (cfg or {}).get("notify_enabled"):
         return None
     nc = notify_load(data_dir)
-    if not (nc.get("enabled") or nc.get("sct_enabled")):
-        return None                 # 没配通道就别排队，否则 pending 会无限膨胀
+    # 两道闸：UPS 侧的通知开关（老配置仍有效）+ 这里选的「通知方式」
+    if not notify_channels(nc, "ups"):
+        return None                 # 一个通道都不用发就别排队，否则 pending 会无限膨胀
 
     st = ups_state_read(data_dir)
     now = time.time()
@@ -6341,7 +6464,7 @@ def ups_notify_after_poll(events, snap, cfg, data_dir, port=8777):
             continue
         subject, body = ups_build_msg(ev, snap, port)
         try:
-            ok, res = notify_send_all(nc, subject, body)
+            ok, res = notify_send_all(nc, subject, body, "ups")
         except Exception as e:
             ok, res = False, {"error": str(e)[:120]}
         if ok:
@@ -6754,12 +6877,12 @@ class UpsGuard(object):
     def _notify_sync(self, etype, snap, note):
         """关机前必须同步推：走队列的话进程一死，那条通知就永远发不出去。"""
         nc = notify_load(self.data_dir)
-        if not (nc.get("enabled") or nc.get("sct_enabled")):
+        if not notify_channels(nc, "ups"):
             return
         ev = {"type": etype, "ts": int(time.time()), "note": note}
         try:
             subject, body = ups_build_msg(ev, snap, self._port())
-            ok, res = notify_send_all(nc, subject, body)
+            ok, res = notify_send_all(nc, subject, body, "ups")
             print("[fnmonitor] 关机前同步推送%s：%s"
                   % ("成功" if ok else "失败", str(res)[:160]))
         except Exception as e:
@@ -10846,7 +10969,7 @@ class MonitorApp:
                "img-src 'self' data:; connect-src 'self'; frame-ancestors *")
         POST_ONLY = {"/api/auth/password", "/api/auth/setup", "/api/auth/logout", "/api/docker/action",
                      "/api/vm/action", "/api/config/save", "/api/update/install",
-                     "/api/notify/save", "/api/notify/test", "/api/disk_scan/now",
+                     "/api/notify/save", "/api/notify/test", "/api/notify/route", "/api/disk_scan/now",
                      "/api/idrac/save", "/api/idrac/test", "/api/idrac/refresh",
                      "/api/ups/save", "/api/ups/guard/save", "/api/ups/guard/cancel",
                      "/api/ups/guard/sim", "/api/ups/collect", "/api/ups/notify/test",
@@ -11322,6 +11445,9 @@ class MonitorApp:
                 if path == "/api/notify/test":
                     self._json(app.api_notify_test(data))
                     return
+                if path == "/api/notify/route":
+                    self._json(app.api_notify_route(data))
+                    return
                 if path == "/api/idrac/save":
                     self._json(app.api_idrac_save(data))
                     return
@@ -11542,6 +11668,20 @@ class MonitorApp:
         ch = data.get("channel") if isinstance(data, dict) else ""
         return notify_test(self.data_dir, ch)
 
+    def api_notify_route(self, data):
+        """改某个功能用哪种通知方式（邮件 / 微信）。channels 传空数组即该功能不发。"""
+        data = data if isinstance(data, dict) else {}
+        feature = str(data.get("feature") or "").strip()
+        cfg, err = notify_set_route(self.data_dir, feature, data.get("channels"))
+        if err:
+            return {"ok": False, "error": err, "notify": notify_public(cfg)}
+        used = (cfg.get("routes") or {}).get(feature) or []
+        label = dict(NOTIFY_FEATURES).get(feature, feature)
+        print("[fnmonitor] 通知路由已更新：%s → %s"
+              % (label, "、".join(NOTIFY_CHANNEL_LABEL.get(c, c) for c in used) or "不发"))
+        return {"ok": True, "notify": notify_public(cfg),
+                "message": "%s：%s" % (label, "、".join(NOTIFY_CHANNEL_LABEL.get(c, c) for c in used) or "不发通知")}
+
     def api_idrac_get(self, query=None):
         """iDRAC 全量：实时组（机型/健康/风扇/温度/功耗/SEL）+ 固定信息台账
         （CPU/内存条/阵列卡/物理盘槽位/卷/固件）。
@@ -11614,6 +11754,10 @@ class MonitorApp:
         cfg, err = idrac_save(self.data_dir, data if isinstance(data, dict) else {})
         if err:
             return {"ok": False, "error": err, "config": idrac_public(cfg)}
+        if isinstance(data, dict) and "notify_channels" in data:
+            _nc, nerr = notify_set_route(self.data_dir, "hw", data.get("notify_channels"))
+            if nerr:
+                print("[fnmonitor] iDRAC 通知方式保存失败：%s" % nerr)
         print("[fnmonitor] iDRAC 配置已更新：%s 地址=%s"
               % ("开" if cfg.get("enabled") else "关", cfg.get("host") or "-"))
         return {"ok": True, "error": "", "config": idrac_public(cfg),
@@ -12451,6 +12595,11 @@ class MonitorApp:
         cfg, err = ups_save(self.data_dir, data)
         out = {"ok": not err, "error": err or "", "config": ups_public(cfg)}
         if not err:
+            # 「通知方式」跟着同一次保存走，省一次往返；真正落盘在 notify.json 的 routes
+            if isinstance(data, dict) and "notify_channels" in data:
+                _nc, nerr = notify_set_route(self.data_dir, "ups", data.get("notify_channels"))
+                if nerr:
+                    print("[fnmonitor] UPS 通知方式保存失败：%s" % nerr)
             out["message"] = "已保存"
             self._overview_bytes = b""
         return out

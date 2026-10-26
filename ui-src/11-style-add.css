@@ -94,7 +94,7 @@
 @media (max-width: 640px) {
   .bottom-nav { padding-bottom: calc(6px + max(env(safe-area-inset-bottom, 0px), var(--extra-inset, 0px))); }
   .page { padding-bottom: calc(110px + max(env(safe-area-inset-bottom, 0px), var(--extra-inset, 0px))); }
-  .toasts { bottom: calc(86px + max(env(safe-area-inset-bottom, 0px), var(--extra-inset, 0px))); }
+  .toasts { top: calc(56px + 8px); max-width: calc(100vw - 24px); }
   .dcores { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .hw-cores { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .temp-cells { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -132,6 +132,15 @@ dd .diag-link { margin: 0; height: 24px; }
 .ig-row .ig-state { font-size: var(--fs-xs); font-weight: 600; }
 .ig-row .ig-state.on { color: var(--warn); } .ig-row .ig-state.gone { color: var(--ink-3); }
 .btn.sm { height: 30px; padding: 0 12px; font-size: var(--fs-xs); }
+/* ---- 通知方式选择：每个功能自己选发到哪几个通道 ---- */
+.nroute { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; justify-content: flex-end; }
+.set-row.block .nroute { justify-content: flex-start; }
+.nroute .btn { color: var(--ink-2); transition: background var(--dur-1), color var(--dur-1); }
+.nroute .btn[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.nroute .btn[aria-pressed="true"]:hover { background: color-mix(in srgb, var(--accent) 86%, var(--card)); }
+.nroute .btn[aria-pressed="true"]::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
+.nroute .nr-note { font-size: var(--fs-xs); color: var(--warn-fill); line-height: 1.5; }
+
 /* 健康检查抽屉里动态插入的「需要处理 / 已忽略」分组，沿用抽屉直接子元素的间距 */
 [data-ref="probs"] > * + * { margin-top: var(--s4); }
 /* 虚拟机列表：沿用容器行样式，多一列磁盘读写（窄屏先隐藏） */
