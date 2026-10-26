@@ -44,6 +44,12 @@
 
 /* ---- 设置分组：事件选择与操作按钮 ---- */
 .up-evs { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-start; }
+/* 事件 chip 的选中态：.btn 本身没有 aria-pressed 样式，不补的话选了和没选一个样 */
+.up-evs .btn { color: var(--ink-2); transition: background var(--dur-1), color var(--dur-1), box-shadow var(--dur-1); }
+.up-evs .btn[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.up-evs .btn[aria-pressed="true"]:hover { background: color-mix(in srgb, var(--accent) 86%, var(--card)); }
+/* 小圆点用 currentColor，纯图形不受字体与主题影响，也照顾到只看明暗的用户 */
+.up-evs .btn[aria-pressed="true"]::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
 .up-acts { display: inline-flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .up-warn { display: flex; gap: 6px; align-items: flex-start; margin: 10px 0 2px; color: var(--warn-fill); }
 .up-conf { display: grid; gap: 4px; justify-items: start; }

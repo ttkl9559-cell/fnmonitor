@@ -222,6 +222,10 @@ function renderUps(card) {
 
   const x = collect(card);
   const cfg = () => (S.ups && S.ups.config) || {};
+  // 事件勾选的本地镜像：点击立刻翻转视觉，不等 POST 回来；连点也不会因为读到
+  // 旧配置而互相打架。保存失败时 _sync() 会按服务端真值整组重画。
+  let evSel = new Set(cfg().notify_events || []);
+  const paintEvs = () => $$('[data-ev]', card).forEach(b => b.setAttribute('aria-pressed', String(evSel.has(b.dataset.ev))));
   const save = async (patch, label) => {
     try {
       const j = await API.post('/api/ups/save', patch);
@@ -266,9 +270,10 @@ function renderUps(card) {
     }
     const ev = e.target.closest('[data-ev]');
     if (ev) {
-      const code = ev.dataset.ev, cur = new Set(cfg().notify_events || []);
-      cur.has(code) ? cur.delete(code) : cur.add(code);
-      return save({ notify_events: [...cur] }, '告警事件');
+      const code = ev.dataset.ev;
+      evSel.has(code) ? evSel.delete(code) : evSel.add(code);
+      paintEvs();
+      return save({ notify_events: [...evSel] }, '告警事件');
     }
     const act = e.target.closest('[data-act]');
     if (act) {
@@ -310,7 +315,8 @@ function renderUps(card) {
       else if (document.activeElement !== el) el.value = (k === 'battery_dod') ? Math.round((+v || 0) * 100) : (v == null ? '' : v);
     });
     const evs = new Set(c.notify_events || []);
-    $$('[data-ev]', card).forEach(b => b.setAttribute('aria-pressed', String(evs.has(b.dataset.ev))));
+    evSel = evs;
+    paintEvs();
     if (x.mode && x.mode.set) x.mode.set(c.guard_mode || 'notify');
     const conf = (S.upsGuard && S.upsGuard.conflicts) || {};
     if (conf.risk) setHTML(x.conf, `<span class="pill ${conf.risk === 'high' ? 'crit' : conf.risk === 'medium' ? 'warn' : 'ok'}">${esc({ high: '有冲突', medium: '需确认', none: '无冲突' }[conf.risk] || conf.risk)}</span><span class="ug-note">${esc(conf.verdict_cn || '')}</span>${(conf.items || []).filter(i => i.level !== 'info').map(i => `<div class="ug-note">· ${esc(i.title)}：${esc(i.fix || '')}</div>`).join('')}`);

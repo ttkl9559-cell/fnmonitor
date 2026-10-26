@@ -1326,6 +1326,10 @@ dd .diag-link{margin:0;height:24px}
 .ev-tag,.ev-note{grid-column:1 / -1}
 }
 .up-evs{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-start}
+.up-evs .btn{color:var(--ink-2);transition:background var(--dur-1),color var(--dur-1),box-shadow var(--dur-1)}
+.up-evs .btn[aria-pressed="true"]{background:var(--accent);color:var(--on-accent);font-weight:600}
+.up-evs .btn[aria-pressed="true"]:hover{background:color-mix(in srgb,var(--accent) 86%,var(--card))}
+.up-evs .btn[aria-pressed="true"]::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}
 .up-acts{display:inline-flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .up-warn{display:flex;gap:6px;align-items:flex-start;margin:10px 0 2px;color:var(--warn-fill)}
 .up-conf{display:grid;gap:4px;justify-items:start}
@@ -4405,6 +4409,8 @@ ${UPS_ROW('演练与取消', '演练只跑判定逻辑，绝不关机；取消�
 <p class="sub up-warn" data-gdep>${ic('alert')}真关机不可撤销：只在下拉确认后使用。运行前请先确认飞牛侧 UPS 保护已关闭，并核对电压下限与断电时长。</p>`;
 const x = collect(card);
 const cfg = () => (S.ups && S.ups.config) || {};
+let evSel = new Set(cfg().notify_events || []);
+const paintEvs = () => $$('[data-ev]', card).forEach(b => b.setAttribute('aria-pressed', String(evSel.has(b.dataset.ev))));
 const save = async (patch, label) => {
 try {
 const j = await API.post('/api/ups/save', patch);
@@ -4446,9 +4452,10 @@ return save({ [sw.dataset.k]: on ? 1 : 0 }, labelOf(sw));
 }
 const ev = e.target.closest('[data-ev]');
 if (ev) {
-const code = ev.dataset.ev, cur = new Set(cfg().notify_events || []);
-cur.has(code) ? cur.delete(code) : cur.add(code);
-return save({ notify_events: [...cur] }, '告警事件');
+const code = ev.dataset.ev;
+evSel.has(code) ? evSel.delete(code) : evSel.add(code);
+paintEvs();
+return save({ notify_events: [...evSel] }, '告警事件');
 }
 const act = e.target.closest('[data-act]');
 if (act) {
@@ -4489,7 +4496,8 @@ else if (k === 'notify_quiet' || k === 'ups_name') { if (document.activeElement 
 else if (document.activeElement !== el) el.value = (k === 'battery_dod') ? Math.round((+v || 0) * 100) : (v == null ? '' : v);
 });
 const evs = new Set(c.notify_events || []);
-$$('[data-ev]', card).forEach(b => b.setAttribute('aria-pressed', String(evs.has(b.dataset.ev))));
+evSel = evs;
+paintEvs();
 if (x.mode && x.mode.set) x.mode.set(c.guard_mode || 'notify');
 const conf = (S.upsGuard && S.upsGuard.conflicts) || {};
 if (conf.risk) setHTML(x.conf, `<span class="pill ${conf.risk === 'high' ? 'crit' : conf.risk === 'medium' ? 'warn' : 'ok'}">${esc({ high: '有冲突', medium: '需确认', none: '无冲突' }[conf.risk] || conf.risk)}</span><span class="ug-note">${esc(conf.verdict_cn || '')}</span>${(conf.items || []).filter(i => i.level !== 'info').map(i => `<div class="ug-note">· ${esc(i.title)}：${esc(i.fix || '')}</div>`).join('')}`);
