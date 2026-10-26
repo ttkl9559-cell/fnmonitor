@@ -41,6 +41,18 @@ function computeHealth(o) {
   });
   const dk = S.docker || o.docker;
   if (dockerOk(dk)) { const stopped = (dk.containers || []).filter(x => !ctrRun(x)); if (stopped.length) add('info', 'docker', `${stopped.length} 个容器未运行`, null, 'docker', stopped.map(x => x.name).sort().join('|')); }
+  // UPS：只在启用且读到数据时参与结论（未启用 / 失联不制造噪音）
+  const up = S.ups;
+  if (up && +((up.config || {}).enabled || up.enabled) && up.live) {
+    const ust = +up.live.st || 0, state = up.state || 'ok';
+    if (ust & 2) add('crit', 'ups:ob', '市电中断，UPS 正以电池供电', null, 'ups');
+    if (ust & 4) add('crit', 'ups:lb', 'UPS 电池电量过低，随时可能关机', null, 'ups');
+    if (ust & 8) add('warn', 'ups:rb', 'UPS 报告需要更换电池', null, 'ups');
+    if (ust & 1024) add('warn', 'ups:over', 'UPS 输出过载', null, 'ups');
+    if (state === 'stale') add('warn', 'ups:stale', 'UPS 通信中断（data stale）', null, 'ups');
+    else if (state !== 'ok' && state !== 'init') add('warn', 'ups:err', 'UPS 读取异常：' + (up.error || state), null, 'ups');
+    else if (up.health && /^(critical|poor)$/.test(up.health.grade)) add('warn', 'ups:health', 'UPS 电池' + (up.health.grade_cn || '容量衰减'), null, 'ups');
+  }
   // 忽略分流：指纹一致 → 已忽略（不计入结论与健康分）；指纹变化 → 重新提醒并标注
   const issues = [], ignored = [];
   all.forEach(it => { const ig = Ignore.get(it.key); if (ig && ig.fp === it.fp) ignored.push(it); else { if (ig) { it.changed = true; it.text += ' · 较忽略时有变化'; } issues.push(it); } });
@@ -104,6 +116,7 @@ const Hero = {
       const it = this.issues && this.issues[+b.dataset.i]; if (!it) return;
       if (it.sheet) openSheet(it.sheet);
       else if (it.go === 'docker') { Docker.setFilter('exited'); go('docker'); }
+      else if (it.go === 'ups') go('ups');
       else if (it.go === 'retry') Poll.run('overview');
     });
     this.r.issues.addEventListener('click', e => { if (e.target.closest('[data-ignored]')) openSheet('health'); });

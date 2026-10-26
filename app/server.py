@@ -5544,6 +5544,1668 @@ class IdracSlowPoller(threading.Thread):
             _IDRAC_SLOW_WAKE.clear()
 
 
+# ---------------------------------------------------------------------------
+# UPS 电源（NUT 客户端，移植自 upshealth）
+# ---------------------------------------------------------------------------
+# 只依赖系统自带的 NUT 客户端 upsc（飞牛「UPS 电源管理」启用后即有）。
+# 不读 USB / HID，不写任何硬件，纯只读客户端；shutdown 只在用户显式打开
+# 「关机保护 → 真关机」后才会被调用。
+#
+# 数据分三处：ups.json（配置）、ups_state.json（告警去抖/待重投）、
+# ups_events.jsonl（事件流水）。历史曲线走既有 metrics 表（ups_* 前缀），
+# 不另建表。
+UPS_FILE = "ups.json"
+UPS_STATE_FILE = "ups_state.json"
+UPS_EVENT_FILE = "ups_events.jsonl"
+UPS_GUARD_AUDIT = "ups_guard.jsonl"
+UPS_LAST_FILE = "ups_guard_last.json"
+UPS_EVENT_MAX = 500
+# 电压硬下限：已接近 1.75V/cell 深放底线，到了这里不再等宽限期。
+# 不可配置、不可绕过（配置侧另有 max() 夹取，双保险）。
+UPS_GUARD_FLOOR_V = 21.4
+# Peukert 指数经验区间：12V 通用型 AGM/铅钙电池多在 1.15~1.30。
+# 不知道用户装的是哪一种，所以给「期望续航区间」，只判实测是否落在区间内。
+UPS_PEUKERT_RANGE = (1.15, 1.30)
+UPS_NUT_DEVICE_CONF = "/etc/nut/device.conf"
+UPS_NUT_UPSMON_CONF = "/etc/nut/upsmon.conf"
+UPS_NUT_UPSSCHED_CONF = "/etc/nut/upssched.conf"
+
+# ups.status 单词 → 位。与 NUT 的 ups.status 定义一致，顺序即展示顺序。
+UPS_STATUS_BITS = [
+    ("OL", "在线", 1 << 0), ("OB", "电池供电", 1 << 1), ("LB", "低电量", 1 << 2),
+    ("RB", "需换电池", 1 << 3), ("CHRG", "充电中", 1 << 4), ("DISCHRG", "放电中", 1 << 5),
+    ("ALARM", "告警", 1 << 6), ("BYPASS", "旁路", 1 << 7), ("CAL", "校准中", 1 << 8),
+    ("OFF", "已关闭", 1 << 9), ("OVER", "超载", 1 << 10), ("TRIM", "降压", 1 << 11),
+    ("BOOST", "升压", 1 << 12), ("FSD", "强制关机", 1 << 13),
+]
+UPS_BIT_OL, UPS_BIT_OB, UPS_BIT_LB, UPS_BIT_RB = 1, 2, 4, 8
+UPS_BIT_CHRG, UPS_BIT_DISCHRG, UPS_BIT_ALARM = 16, 32, 64
+UPS_BIT_BYPASS, UPS_BIT_CAL, UPS_BIT_OFF, UPS_BIT_OVER = 128, 256, 512, 1024
+UPS_BIT_FSD = 8192
+
+# 事件 → (中文名, 级别)。级别决定静默时段是否放行：crit 永不静默。
+UPS_EVENT_META = {
+    "POWER_LOSS": ("市电中断", "crit"),
+    "POWER_RESTORE": ("市电恢复", "ok"),
+    "LOW_BATTERY": ("电池电量过低", "crit"),
+    "REPLACE_BATTERY": ("需要更换电池", "warn"),
+    "ALARM": ("UPS 告警", "warn"),
+    "OVERLOAD": ("输出过载", "crit"),
+    "FORCED_SHUTDOWN": ("UPS 强制关机", "crit"),
+    "DEVICE_LOST": ("UPS 通信中断", "crit"),
+    "DEVICE_BACK": ("UPS 恢复通信", "ok"),
+    # 关机保护自产的两类，不参与「告警事件」勾选，始终发送（属安全告警）
+    "GUARD_ALERT": ("关机保护告警", "crit"),
+    "GUARD_SHUTDOWN": ("UPS 即将关机", "crit"),
+}
+UPS_LEVEL_TAG = {"crit": "严重", "warn": "留意", "ok": "恢复", "info": "信息"}
+UPS_NOTIFY_CHOICES = ["POWER_LOSS", "POWER_RESTORE", "LOW_BATTERY", "REPLACE_BATTERY",
+                      "ALARM", "OVERLOAD", "FORCED_SHUTDOWN", "DEVICE_LOST", "DEVICE_BACK"]
+
+UPS_DEFAULT = {
+    "enabled": 0,
+    "ups_name": "",
+    "poll_interval": 5,
+    "battery_ah": 9.0,
+    "battery_dod": 0.85,
+    "battery_eff": 0.85,
+    "peukert_k": 0.0,
+    "notify_enabled": 1,
+    "notify_events": list(UPS_NOTIFY_CHOICES),
+    "notify_debounce_s": 60,
+    "notify_max_per_min": 8,
+    "notify_quiet": "",
+    "guard_enabled": 0,
+    "guard_mode": "notify",
+    "guard_time_min": 10,
+    "guard_low_v": 22.6,
+    "guard_grace_s": 60,
+    "guard_min_ob_s": 30,
+    "guard_boot_hold_s": 300,
+    "guard_allow_conflict": 0,
+}
+
+_UPS_LOCK = threading.Lock()          # 保护 _UPS_LATEST
+_UPS_POLLER = None
+_UPS_POLLER_LOCK = threading.Lock()
+_UPS_WAKE = threading.Event()         # 配置变更 / 手动采集时打断等待
+_UPS_LATEST = {}                      # 最近一帧快照；HTTP 只读这份内存
+_UPS_GUARD = None                     # UpsGuard 单例（懒创建）
+_UPS_GUARD_LOCK = threading.Lock()
+_UPS_EVENTS = []                      # 内存事件环，最新的在末尾
+_UPS_EV_LOCK = threading.Lock()
+_UPS_CONFLICT_CACHE = {"ts": 0.0, "data": None}
+_UPS_CONFLICT_LOCK = threading.Lock()
+_UPS_CFG_CACHE = {"ts": 0.0, "mtime": None, "cfg": None}
+
+
+def ups_onoff(x):
+    return 1 if str(x).lower() in ("1", "true", "on", "yes") else 0
+
+
+def ups_frac(v, lo, hi, dflt=0.0):
+    try:
+        f = float(v)
+    except Exception:
+        return dflt
+    if f != f:                      # NaN
+        return dflt
+    return max(lo, min(hi, f))
+
+
+def ups_int(v, lo, hi, dflt):
+    try:
+        n = int(float(v))
+    except Exception:
+        return dflt
+    return max(lo, min(hi, n))
+
+
+def ups_quiet_ok(raw):
+    """静默时段只接受 HH:MM-HH:MM，其余一律存空串（不静默）。"""
+    s = str(raw or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", s)
+    if not m:
+        return ""
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    if not (0 <= h1 <= 23 and 0 <= h2 <= 23 and 0 <= m1 <= 59 and 0 <= m2 <= 59):
+        return ""
+    return "%02d:%02d-%02d:%02d" % (h1, m1, h2, m2)
+
+
+def ups_normalize(data, base=None):
+    """把任意来源的配置归一化 + 夹取。base 为底（默认 UPS_DEFAULT）。"""
+    cfg = dict(base or UPS_DEFAULT)
+    data = data or {}
+    if "enabled" in data:
+        cfg["enabled"] = ups_onoff(data["enabled"])
+    if "ups_name" in data:
+        cfg["ups_name"] = clean_text(str(data.get("ups_name") or ""), 64)
+    if "poll_interval" in data:
+        cfg["poll_interval"] = ups_int(data["poll_interval"], 3, 60, 5)
+    for k, lo, hi, d in (("battery_ah", 0.5, 200.0, 9.0),
+                         ("battery_dod", 0.3, 1.0, 0.85),
+                         ("battery_eff", 0.5, 1.0, 0.85)):
+        if k in data:
+            cfg[k] = round(ups_frac(data[k], lo, hi, d), 2)
+    if "peukert_k" in data:
+        k = ups_frac(data["peukert_k"], 0.0, 2.0, 0.0)
+        # 0 = 用经验区间；其余必须 > 1 才有物理意义
+        cfg["peukert_k"] = round(k, 2) if k > 1.0 else 0.0
+    if "notify_enabled" in data:
+        cfg["notify_enabled"] = ups_onoff(data["notify_enabled"])
+    if "notify_events" in data:
+        want = data.get("notify_events")
+        if isinstance(want, str):
+            want = [s.strip() for s in want.split(",")]
+        if not isinstance(want, (list, tuple)):
+            want = list(UPS_NOTIFY_CHOICES)
+        seen, out = set(), []
+        for x in want:
+            code = str(x or "").strip().upper()
+            if code in UPS_EVENT_META and code not in seen:
+                seen.add(code)
+                out.append(code)
+        cfg["notify_events"] = out
+    if "notify_debounce_s" in data:
+        cfg["notify_debounce_s"] = ups_int(data["notify_debounce_s"], 0, 3600, 60)
+    if "notify_max_per_min" in data:
+        cfg["notify_max_per_min"] = ups_int(data["notify_max_per_min"], 1, 60, 8)
+    if "notify_quiet" in data:
+        cfg["notify_quiet"] = ups_quiet_ok(data.get("notify_quiet"))
+    if "guard_enabled" in data:
+        cfg["guard_enabled"] = ups_onoff(data["guard_enabled"])
+    if "guard_mode" in data:
+        mode = str(data.get("guard_mode") or "").strip().lower()
+        cfg["guard_mode"] = mode if mode in ("notify", "shutdown") else "notify"
+    if "guard_time_min" in data:
+        cfg["guard_time_min"] = ups_int(data["guard_time_min"], 1, 120, 10)
+    if "guard_low_v" in data:
+        # 硬下限双保险之一：配置侧直接抬到 21.4，用户改不到更低
+        cfg["guard_low_v"] = round(max(UPS_GUARD_FLOOR_V,
+                                       ups_frac(data["guard_low_v"], UPS_GUARD_FLOOR_V, 30.0, 22.6)), 1)
+    if "guard_grace_s" in data:
+        cfg["guard_grace_s"] = ups_int(data["guard_grace_s"], 10, 600, 60)
+    if "guard_min_ob_s" in data:
+        cfg["guard_min_ob_s"] = ups_int(data["guard_min_ob_s"], 10, 600, 30)
+    if "guard_boot_hold_s" in data:
+        cfg["guard_boot_hold_s"] = ups_int(data["guard_boot_hold_s"], 0, 3600, 300)
+    if "guard_allow_conflict" in data:
+        cfg["guard_allow_conflict"] = ups_onoff(data["guard_allow_conflict"])
+    return cfg
+
+
+def ups_load(data_dir):
+    """读 ups.json；坏文件/坏字段只影响自己，其余回落默认。"""
+    user = {}
+    if data_dir:
+        try:
+            with open(os.path.join(data_dir, UPS_FILE), "r", encoding="utf-8",
+                      errors="ignore") as f:
+                user = json.load(f)
+            if not isinstance(user, dict):
+                user = {}
+        except Exception:
+            user = {}
+    return ups_normalize(user)
+
+
+def ups_upsc():
+    """upsc 的真实路径；找不到返回空串（= 系统没装 NUT）。"""
+    for name in ("upsc",):
+        for p in ("/usr/bin/" + name, "/bin/" + name, "/usr/sbin/" + name,
+                  "/sbin/" + name, "/usr/local/bin/" + name):
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        w = shutil.which(name)
+        if w:
+            return w
+    return ""
+
+
+def ups_run(args, timeout=8):
+    """返回 (rc, stdout, stderr)。FileNotFoundError → -2，超时 → -3。"""
+    try:
+        p = subprocess.run(args, capture_output=True, timeout=timeout,
+                           env=dict(os.environ, LC_ALL="C"))
+        return (p.returncode, p.stdout.decode("utf-8", "replace"),
+                p.stderr.decode("utf-8", "replace"))
+    except FileNotFoundError:
+        return (-2, "", "command not found: %s" % args[0])
+    except subprocess.TimeoutExpired:
+        return (-3, "", "timeout")
+    except Exception as e:
+        return (-1, "", str(e))
+
+
+class UpsError(Exception):
+    """NUT 读取失败。code 直接用作快照的 live.state，前端按它出提示。"""
+
+    def __init__(self, code, msg, hint=""):
+        Exception.__init__(self, msg)
+        self.code = code
+        self.message = msg
+        self.hint = hint
+
+
+def ups_list():
+    """动态发现 UPS 实例名，绝不硬编码。"""
+    exe = ups_upsc()
+    if not exe:
+        raise UpsError("no_nut", "未找到 upsc 命令",
+                       "系统未安装 NUT，或没启用飞牛「UPS 电源管理」")
+    rc, out, err = ups_run([exe, "-l"], timeout=8)
+    if rc != 0:
+        low = (err + out).lower()
+        if ("connection refused" in low or "cannot connect" in low
+                or "failed to connect" in low):
+            raise UpsError("no_nut", "连不上 NUT 服务（127.0.0.1:3493）",
+                           "nut-server 未运行；飞牛关掉 UPS 电源管理后 NUT 会随之停止")
+        raise UpsError("error", "upsc -l 执行失败：%s" % (err.strip() or out.strip())[:200])
+    names = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 新版 NUT 的 `upsc -l` 会输出 "名称: 描述"，取冒号右侧并去空白；
+        # 不去空白会让后续 `upsc " 名称"` 直接失败
+        names.append(line.rsplit(":", 1)[-1].strip() if ":" in line else line)
+    names = [n for n in names if n]
+    if not names:
+        raise UpsError("no_device", "NUT 在运行但没有发现任何 UPS",
+                       "UPS 可能没接 USB 线，或驱动未启动")
+    return names
+
+
+def ups_pick(cfg):
+    """按配置优先，否则第一台。返回 (名称, 全部名称)。"""
+    names = ups_list()
+    want = str((cfg or {}).get("ups_name") or "").strip()
+    if want and want in names:
+        return want, names
+    return names[0], names
+
+
+def ups_read_vars(name):
+    """读全量变量。失败抛 UpsError。"""
+    exe = ups_upsc()
+    if not exe:
+        raise UpsError("no_nut", "未找到 upsc 命令")
+    rc, out, err = ups_run([exe, name], timeout=8)
+    if rc != 0:
+        low = (err + out).lower()
+        if "connection refused" in low:
+            raise UpsError("no_nut", "连不上 NUT 服务")
+        if "data stale" in low or "driver not connected" in low:
+            raise UpsError("stale", "驱动与 UPS 通信中断（data stale）",
+                           "USB 线可能松动，或驱动进程已退出")
+        if "unknown ups" in low:
+            raise UpsError("no_device", "UPS 实例 %s 不存在" % name)
+        raise UpsError("error", "读取 UPS 失败：%s" % (err.strip() or out.strip())[:200],
+                       "设备存在但无响应，检查 USB 连接")
+    data = {}
+    for line in out.splitlines():
+        line = line.rstrip()
+        if not line or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip()
+        if not k or " " in k:
+            continue
+        data[k] = v.strip()
+    if not data:
+        raise UpsError("error", "UPS 返回空数据")
+    return data
+
+
+def ups_fnum(v):
+    """严格数值转换：读不到返回 None，绝不返回 0（0 会被当成真实读数）。"""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or not re.match(r"^[-+]?\d+(?:\.\d+)?$", s):
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def ups_decode_status(s):
+    mask = 0
+    words = (s or "").split()
+    for code, _cn, bit in UPS_STATUS_BITS:
+        if code in words:
+            mask |= bit
+    return mask
+
+
+def ups_status_labels(mask):
+    return [cn for code, cn, bit in UPS_STATUS_BITS if mask & bit]
+
+
+def ups_status_codes(mask):
+    return [code for code, _cn, bit in UPS_STATUS_BITS if mask & bit]
+
+
+def ups_build(name, raw, cfg):
+    """原始变量 → 快照（device + live + health）。"""
+    live = {"status": raw.get("ups.status", "")}
+    live["st"] = ups_decode_status(live["status"])
+    live["labels"] = ups_status_labels(live["st"])
+    live["codes"] = ups_status_codes(live["st"])
+    live["in_v"] = ups_fnum(raw.get("input.voltage"))
+    live["in_hz"] = ups_fnum(raw.get("input.frequency"))
+    live["out_v"] = ups_fnum(raw.get("output.voltage"))
+    live["out_a"] = ups_fnum(raw.get("output.current"))
+    live["out_hz"] = ups_fnum(raw.get("output.frequency"))
+    live["load"] = ups_fnum(raw.get("ups.load"))
+    live["rp"] = ups_fnum(raw.get("ups.realpower"))
+    live["chg"] = ups_fnum(raw.get("battery.charge"))
+    live["rt"] = ups_fnum(raw.get("battery.runtime"))
+    live["bat_v"] = ups_fnum(raw.get("battery.voltage"))
+    live["temp"] = ups_fnum(raw.get("battery.temperature"))
+    live["nominal_va"] = ups_fnum(raw.get("ups.power.nominal"))
+    live["source"] = raw.get("input.source") or ""
+
+    # 市电切换的瞬间，UPS 会在一个 poll 周期里把输入/输出/负载一起吐成 0。
+    # 那是「还没读到」而不是「真的是 0」——在线式 UPS 只要在供电，输出电压
+    # 就不可能接近 0。这类帧必须剔除，否则会把曲线砸出深坑，更危险的是
+    # 拿它参与关机判定。
+    ov = live.get("out_v")
+    live["valid"] = not (ov is not None and ov < 50)
+    live["volatile"] = not live["valid"]
+    if not live["valid"]:
+        for k in ("in_v", "in_hz", "out_v", "out_a", "out_hz", "load", "rp", "nominal_va"):
+            live[k] = None
+
+    device = {
+        "name": name,
+        "mfr": raw.get("device.mfr") or raw.get("ups.mfr") or "",
+        "model": raw.get("device.model") or raw.get("ups.model") or "",
+        "serial": raw.get("device.serial") or raw.get("ups.serial") or "",
+        "type": raw.get("ups.type") or "",
+        "driver": raw.get("driver.name") or "",
+        "driver_data": raw.get("driver.version.data") or "",
+        "nut": raw.get("driver.version") or "",
+        "vid": raw.get("ups.vendorid") or "",
+        "pid": raw.get("ups.productid") or "",
+    }
+    return {"ts": int(time.time()), "device": device, "live": live,
+            "health": ups_assess(live, raw, cfg)}
+
+
+def ups_assess(live, raw, cfg):
+    """电池健康：Peukert 倍率修正后的区间判定。
+
+    旧算法拿「当前负载 × 满电续航」当可放能量再除以铭牌能量，对铅酸是错的：
+    12V 9Ah 在 1.3C 下只能放出铭牌 35~40%，那是倍率损耗不是老化，换新电池
+    同样只得三四十分，于是永远判「建议更换」。这里改为算期望续航区间，
+    实测落在区间内即「无容量衰减证据」。
+    """
+    chg, rt, rp = live.get("chg"), live.get("rt"), live.get("rp")
+    bat_v = live.get("bat_v")
+    vn = ups_fnum(raw.get("battery.voltage.nominal"))
+    if vn is None and bat_v is not None and bat_v > 10:
+        # 很多固件不给 battery.voltage.nominal；12V 组串按 12 的整数倍推
+        vn = float(round(bat_v / 12.0) * 12)
+    ah = float((cfg or {}).get("battery_ah") or 9.0)
+    dod = float((cfg or {}).get("battery_dod") or 0.85)
+    eff = float((cfg or {}).get("battery_eff") or 0.85)
+    k_fix = float((cfg or {}).get("peukert_k") or 0)
+
+    out = {"score": None, "grade": "unknown", "grade_cn": "数据不足",
+           "verdict": "unknown", "verdict_cn": "数据不足",
+           "capacity_pct": None, "nominal_wh": None, "usable_wh": None,
+           "full_runtime_s": None, "basis": None, "notes": [],
+           "c_rate": None, "bat_amps": None, "ratio": None,
+           "expect_runtime_s": None, "expect_wh_range": None,
+           "peukert_k": None, "calibrated": None, "calib_depth": None}
+    if not vn or vn <= 0 or ah <= 0:
+        out["notes"].append("缺少标称电压或电池容量配置，无法测算")
+        return out
+    nominal_wh = vn * ah
+    out["nominal_wh"] = round(nominal_wh, 1)
+    if not (chg and chg > 5 and rt and rt > 0 and rp and rp > 0):
+        out["notes"].append("需电量 >5% 且有负载时才能测算")
+        return out
+    if eff <= 0 or eff > 1:
+        eff = 0.85
+
+    full_rt = rt / (chg / 100.0)
+    out["full_runtime_s"] = int(full_rt)
+    out["usable_wh"] = round(rp * full_rt / 3600.0, 1)
+
+    i_bat = rp / (vn * eff)
+    c_rate = i_bat / ah
+    out["bat_amps"] = round(i_bat, 2)
+    out["c_rate"] = round(c_rate, 2)
+    i_ref = ah / 20.0
+
+    def expect_at(k):
+        c_eff = ah * (i_ref / i_bat) ** (k - 1.0)
+        return c_eff * vn * dod / rp * 3600.0
+
+    ks = (k_fix,) if k_fix > 1.0 else UPS_PEUKERT_RANGE
+    # k 越小倍率惩罚越轻、修正后可用容量越大 → 期望续航越长，所以下限对 k 上界
+    exp_lo, exp_hi = expect_at(max(ks)), expect_at(min(ks))
+    exp_mid = (exp_lo + exp_hi) / 2.0
+    out["peukert_k"] = round(k_fix, 2) if k_fix > 1.0 else list(UPS_PEUKERT_RANGE)
+    out["expect_runtime_s"] = [int(exp_lo), int(exp_hi)]
+    out["expect_wh_range"] = [round(rp * exp_lo / 3600.0, 1),
+                              round(rp * exp_hi / 3600.0, 1)]
+
+    ratio = full_rt / exp_mid if exp_mid > 0 else None
+    out["ratio"] = round(ratio, 3) if ratio else None
+    out["capacity_pct"] = round(min(150.0, ratio * 100.0), 1) if ratio else None
+
+    sane = True
+    if c_rate < 0.05:
+        sane = False
+        out["notes"].append("负载过轻（%.2fC），UPS 续航估算本身误差很大" % c_rate)
+    elif c_rate > 3.0:
+        sane = False
+        out["notes"].append("放电倍率过高（%.2fC），超出这组电池的设计工况" % c_rate)
+    if rp < 50:
+        sane = False
+        out["notes"].append("实际功率仅 %.0f W，低于可靠测算区间" % rp)
+
+    if ratio is None or not sane:
+        out["verdict"], out["verdict_cn"] = "unknown", "数据不足"
+        out["basis"] = ("当前 %.0f%% 电量、%.0f W 负载、电池侧约 %.1f A（%.2fC），"
+                        "该工况下无法给出可靠容量结论" % (chg, rp, i_bat, c_rate))
+        return out
+
+    if full_rt >= exp_lo:
+        verdict, verdict_cn = "ok", "表现正常"
+    elif full_rt >= exp_lo * 0.85:
+        verdict, verdict_cn = "watch", "略有衰减"
+    else:
+        verdict, verdict_cn = "suspect", "疑似衰减"
+    out["verdict"], out["verdict_cn"] = verdict, verdict_cn
+
+    if ratio >= 1.0:
+        score = 95.0
+    elif ratio >= 0.90:
+        score = 88.0 + (ratio - 0.90) * 70.0
+    elif ratio >= 0.80:
+        score = 76.0 + (ratio - 0.80) * 120.0
+    elif ratio >= 0.70:
+        score = 62.0 + (ratio - 0.70) * 140.0
+    elif ratio >= 0.55:
+        score = 45.0 + (ratio - 0.55) * 113.0
+    else:
+        score = max(0.0, ratio / 0.55 * 45.0)
+
+    if live.get("st", 0) & UPS_BIT_RB:
+        score -= 15
+        out["notes"].append("UPS 主动报告需更换电池（RB），这是固件给出的明确信号")
+    temp = live.get("temp")
+    if temp is not None and temp > 30:
+        score -= min(10.0, (temp - 30) * 2)
+        out["notes"].append("电池温度 %.1f℃ 偏高，每高 10℃ 寿命约减半" % temp)
+    if chg < 90:
+        out["notes"].append("当前电量 %0.0f%%，已按比例折算到满电" % chg)
+
+    out["score"] = int(round(max(0.0, min(100.0, score))))
+    s = out["score"]
+    if s >= 85:
+        out["grade"], out["grade_cn"] = "good", "表现正常"
+    elif s >= 70:
+        out["grade"], out["grade_cn"] = "fair", "略有衰减"
+    elif s >= 55:
+        out["grade"], out["grade_cn"] = "poor", "建议关注"
+    else:
+        out["grade"], out["grade_cn"] = "critical", "疑似严重衰减"
+
+    out["basis"] = (
+        "当前 %.0f%% 电量下续航 %d 秒、负载 %.0f W；电池侧约 %.1f A（%.2fC）。"
+        "按 Peukert 指数 %s 推算，这组 %.0f Ah／%.0f V 电池在该倍率下应能撑 %d~%d 秒，"
+        "实测折算满电 %d 秒，为中位期望的 %0.0f%%。倍率损耗已计入，未计为老化。"
+        % (chg, rt, rp, i_bat, c_rate,
+           ("%.2f" % k_fix) if k_fix > 1.0 else "%.2f~%.2f" % UPS_PEUKERT_RANGE,
+           ah, vn, int(exp_lo), int(exp_hi), int(full_rt), ratio * 100.0))
+    return out
+
+
+# ---------- 事件流水（内存环 + jsonl 追加） ----------
+def ups_events_append(data_dir, evs):
+    if not evs:
+        return
+    with _UPS_EV_LOCK:
+        for ev in evs:
+            _UPS_EVENTS.append(ev)
+        if len(_UPS_EVENTS) > UPS_EVENT_MAX:
+            del _UPS_EVENTS[:len(_UPS_EVENTS) - UPS_EVENT_MAX]
+    if not data_dir:
+        return
+    try:
+        path = os.path.join(data_dir, UPS_EVENT_FILE)
+        with open(path, "a", encoding="utf-8") as f:
+            for ev in evs:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        # 超过 800 行就压回 500 行，避免长期运行无限增长
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                rows = f.readlines()
+            if len(rows) > 800:
+                keep = rows[-UPS_EVENT_MAX:]
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(keep)
+                os.replace(tmp, path)
+        except Exception:
+            pass
+    except Exception as e:
+        print("[fnmonitor] UPS 事件写入失败：%s" % str(e)[:120])
+
+
+def ups_events_load(data_dir, limit=50):
+    """读事件：内存优先，进程刚起时从 jsonl 回填。"""
+    with _UPS_EV_LOCK:
+        have = list(_UPS_EVENTS)
+    if not have and data_dir:
+        try:
+            path = os.path.join(data_dir, UPS_EVENT_FILE)
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                rows = f.readlines()[-UPS_EVENT_MAX:]
+            out = []
+            for line in rows:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(d, dict):
+                    out.append(d)
+            with _UPS_EV_LOCK:
+                if not _UPS_EVENTS:
+                    _UPS_EVENTS.extend(out)
+            have = out
+        except Exception:
+            have = []
+    limit = max(1, min(200, int(limit or 50)))
+    return have[-limit:][::-1], len(have)
+
+
+def ups_detect(poller, snap):
+    """边沿事件检测。返回本轮新事件列表（已写流水，由调用方决定是否推送）。"""
+    live = snap["live"]
+    mask = live["st"]
+    prev = poller.last_mask
+    prev_s = poller.last_status
+    common = {"ts": snap["ts"], "ups": snap["device"]["name"],
+              "from_st": prev_s, "to_st": live["status"],
+              "chg": live.get("chg"), "rt": live.get("rt"), "in_v": live.get("in_v"),
+              "out_v": live.get("out_v"), "load": live.get("load"), "temp": live.get("temp")}
+    out = []
+
+    def add(etype, note):
+        label, level = UPS_EVENT_META.get(etype, (etype, "info"))
+        out.append(dict(common, type=etype, label=label, level=level, note=note))
+
+    if prev is not None and mask != prev:
+        if (prev & UPS_BIT_OB) == 0 and (mask & UPS_BIT_OB):
+            add("POWER_LOSS", "市电中断，切换电池供电")
+        elif (prev & UPS_BIT_OB) and (mask & UPS_BIT_OB) == 0:
+            add("POWER_RESTORE", "市电恢复")
+        if (prev & UPS_BIT_LB) == 0 and (mask & UPS_BIT_LB):
+            add("LOW_BATTERY", "进入低电量状态")
+        if (prev & UPS_BIT_RB) == 0 and (mask & UPS_BIT_RB):
+            add("REPLACE_BATTERY", "UPS 报告需要更换电池")
+        if (prev & UPS_BIT_ALARM) == 0 and (mask & UPS_BIT_ALARM):
+            add("ALARM", "UPS 告警")
+        if (prev & UPS_BIT_FSD) == 0 and (mask & UPS_BIT_FSD):
+            add("FORCED_SHUTDOWN", "UPS 触发强制关机")
+        if (prev & UPS_BIT_OVER) == 0 and (mask & UPS_BIT_OVER):
+            add("OVERLOAD", "输出超载")
+
+    poller.last_mask = mask
+    poller.last_status = live["status"]
+    return out
+
+
+# ---------- 统一通知 ----------
+def ups_quiet_hit(cfg, now=None):
+    """当前是否落在静默时段。返回 True 表示应静默（crit 级别由调用方放行）。"""
+    raw = str((cfg or {}).get("notify_quiet") or "")
+    m = re.match(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$", raw)
+    if not m:
+        return False
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    t = time.localtime(now or time.time())
+    cur = t.tm_hour * 60 + t.tm_min
+    a, b = h1 * 60 + m1, h2 * 60 + m2
+    if a == b:
+        return False
+    return (a <= cur < b) if a < b else (cur >= a or cur < b)
+
+
+def ups_state_read(data_dir):
+    st = {"inited": 0, "ts": 0, "sent": {}, "window": [], "pending": [], "last": None}
+    if not data_dir:
+        return st
+    try:
+        with open(os.path.join(data_dir, UPS_STATE_FILE), "r", encoding="utf-8",
+                  errors="ignore") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            st.update({k: d[k] for k in st if k in d})
+    except Exception:
+        pass
+    if not isinstance(st.get("sent"), dict):
+        st["sent"] = {}
+    for k in ("window", "pending"):
+        if not isinstance(st.get(k), list):
+            st[k] = []
+    return st
+
+
+def ups_state_write(data_dir, st):
+    if not data_dir:
+        return
+    try:
+        st["ts"] = int(time.time())
+        write_json_secure(os.path.join(data_dir, UPS_STATE_FILE), st)
+    except Exception as e:
+        print("[fnmonitor] UPS 告警状态写入失败：%s" % str(e)[:120])
+
+
+def ups_throttled(st, etype, cfg, now):
+    """同类去抖 + 全局限流。只拦「本轮新事件」，pending 重投不走这里。"""
+    deb = int((cfg or {}).get("notify_debounce_s") or 0)
+    last = float((st.get("sent") or {}).get(etype) or 0)
+    if deb > 0 and now - last < deb:
+        return "同类事件 %d 秒内已发送过" % deb
+    cap = int((cfg or {}).get("notify_max_per_min") or 8)
+    win = [t for t in (st.get("window") or []) if now - float(t) < 60]
+    st["window"] = win
+    if len(win) >= cap:
+        return "每分钟上限 %d 条" % cap
+    return ""
+
+
+def ups_build_msg(ev, snap, port=8777):
+    """事件 → (标题, 正文)。风格与硬盘告警一致（[飞牛监控] 前缀 + 逐行字段）。"""
+    etype = ev.get("type") or ""
+    label, level = UPS_EVENT_META.get(etype, (etype or "事件", "info"))
+    dev = (snap or {}).get("device") or {}
+    live = (snap or {}).get("live") or {}
+    who = " ".join(x for x in (dev.get("mfr"), dev.get("model")) if x) or "UPS"
+    subject = "[飞牛监控] UPS %s · %s" % (label, who)
+    if level == "ok":
+        subject = "[飞牛监控] UPS %s · %s" % (label, who)
+    lines = ["检测时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S",
+                                          time.localtime(ev.get("ts") or time.time()))]
+    if ev.get("note"):
+        lines.append("说明：%s" % ev["note"])
+    frm, to = ev.get("from_st") or "", ev.get("to_st") or ""
+    if to and to != frm:
+        lines.append("状态：%s → %s" % (frm or "—", to))
+
+    def fmt(v, unit, nd=0):
+        if v is None:
+            return "—"
+        return ("%." + str(nd) + "f") % float(v) + unit
+
+    chg, rt = ev.get("chg"), ev.get("rt")
+    if chg is not None or rt is not None:
+        tail = ""
+        if rt:
+            m = int(rt) // 60
+            tail = "　剩余续航：%d 分钟" % m if m >= 1 else "　剩余续航：%d 秒" % int(rt)
+        lines.append("电量：%s%s" % (fmt(chg, "%"), tail))
+    iv, ov, bv = ev.get("in_v"), ev.get("out_v"), live.get("bat_v")
+    if iv is not None or ov is not None or bv is not None:
+        lines.append("电压：输入 %s / 输出 %s　电池 %s"
+                     % (fmt(iv, " V", 1), fmt(ov, " V", 1), fmt(bv, " V", 1)))
+    load, temp = ev.get("load"), ev.get("temp")
+    if load is not None or temp is not None:
+        lines.append("负载：%s　电池温度：%s" % (fmt(load, "%"), fmt(temp, " ℃", 1)))
+    if dev.get("serial"):
+        lines.append("序列号：%s" % dev["serial"])
+    ip = notify_lan_ip()
+    if ip:
+        lines.append("详情：http://%s:%d/#/ups" % (ip, int(port or 8777)))
+    return subject, "\n".join(lines)
+
+
+UPS_NOTIFY_TRIES = 5           # 单条事件最多重试次数（5 次 × 60 秒 ≈ 5 分钟）
+UPS_NOTIFY_RETRY_S = 60        # 发送失败后等多久再重投
+
+
+def ups_notify_after_poll(events, snap, cfg, data_dir, port=8777):
+    """事件入队 → 去抖/限流/静默 → 走统一通道发送，失败留在 pending 重投。
+
+    为什么是「重投」而不是硬盘告警那种「下轮重算」：硬盘告警是电平（每轮巡检
+    都能重新算出同一批），UPS 事件是边沿（POWER_LOSS 只在那一次状态跳变时产生），
+    不排队就永久丢失。
+
+    重投必须由「空事件 + 队列非空」这条路径驱动：边沿事件不会自己再出现，
+    若只在有新事件时才顺带重投，一条发送失败的市电中断通知就永远发不出去
+    （NAS 上事件稀疏，可能几天才有下一条）。因此采集线程每轮都会带空列表调一次。
+    """
+    events = events or []
+    if events:
+        ups_events_append(data_dir, events)
+    if not (cfg or {}).get("notify_enabled"):
+        return None
+    nc = notify_load(data_dir)
+    if not (nc.get("enabled") or nc.get("sct_enabled")):
+        return None                 # 没配通道就别排队，否则 pending 会无限膨胀
+
+    st = ups_state_read(data_dir)
+    now = time.time()
+    want = set((cfg or {}).get("notify_events") or [])
+    added = 0
+    for ev in events:
+        etype = ev.get("type")
+        # GUARD_* 是关机保护的产物，不受「告警事件」勾选控制，始终发送
+        if etype not in want and not str(etype).startswith("GUARD_"):
+            continue
+        level = ev.get("level") or UPS_EVENT_META.get(etype, ("", "info"))[1]
+        if level != "crit" and ups_quiet_hit(cfg, now):
+            print("[fnmonitor] UPS 事件 %s 处于静默时段，跳过通知" % etype)
+            continue
+        why = ups_throttled(st, etype, cfg, now)
+        if why:
+            print("[fnmonitor] UPS 事件 %s 未发送：%s" % (etype, why))
+            continue
+        st["pending"].append({"type": etype, "ts": int(now), "note": ev.get("note") or "",
+                              "chg": ev.get("chg"), "rt": ev.get("rt"),
+                              "in_v": ev.get("in_v"), "out_v": ev.get("out_v"),
+                              "load": ev.get("load"), "temp": ev.get("temp"),
+                              "from_st": ev.get("from_st"), "to_st": ev.get("to_st"),
+                              "tries": 0})
+        added += 1
+    # 队列空且本轮没新增 → 不写状态文件（每 5 秒一次写盘没必要，也可能唤醒休眠盘）
+    if not st.get("pending"):
+        if added:
+            ups_state_write(data_dir, st)
+        return None
+
+    sent_any = None
+    keep = []
+    for ev in st["pending"][:20]:
+        etype = ev.get("type")
+        if etype not in want and not str(etype).startswith("GUARD_"):
+            continue                # 已在队列里但不符合当前勾选，直接丢弃
+        if int(ev.get("tries") or 0) >= UPS_NOTIFY_TRIES:
+            print("[fnmonitor] UPS 事件 %s 重试 %d 次仍失败，放弃"
+                  % (etype, UPS_NOTIFY_TRIES))
+            continue
+        if float(ev.get("next_try") or 0) > now:
+            keep.append(ev)         # 还没到重试时间
+            continue
+        subject, body = ups_build_msg(ev, snap, port)
+        try:
+            ok, res = notify_send_all(nc, subject, body)
+        except Exception as e:
+            ok, res = False, {"error": str(e)[:120]}
+        if ok:
+            st["sent"][etype] = now
+            st["window"].append(now)
+            st["last"] = {"ts": int(now), "ok": True, "subject": subject,
+                          "types": [etype], "channels": res}
+            sent_any = subject
+        else:
+            ev["tries"] = int(ev.get("tries") or 0) + 1
+            ev["next_try"] = int(now + UPS_NOTIFY_RETRY_S)
+            keep.append(ev)
+            print("[fnmonitor] UPS 通知发送失败（%s，第 %d 次）：%s"
+                  % (etype, ev["tries"], str(res)[:160]))
+    st["pending"] = keep[-20:]
+    ups_state_write(data_dir, st)
+    return sent_any
+
+
+# ---------- 关机保护 ----------
+def ups_guard_dur(sec):
+    try:
+        sec = int(max(0, sec))
+    except Exception:
+        return "—"
+    if sec < 60:
+        return "%d 秒" % sec
+    if sec < 3600:
+        m, s = sec // 60, sec % 60
+        return ("%d 分 %d 秒" % (m, s)) if s else ("%d 分钟" % m)
+    h, m = sec // 3600, (sec % 3600) // 60
+    return ("%d 小时 %d 分" % (h, m)) if m else ("%d 小时" % h)
+
+
+UPS_GUARD_STATE_CN = {"idle": "待命", "held": "启动静默", "watching": "观察中",
+                      "armed": "待执行关机", "alerted": "已告警", "fired": "已下发关机",
+                      "blocked": "已阻止", "unknown": "未知"}
+UPS_RISK_CN = {"none": "无冲突", "medium": "需确认", "high": "有冲突"}
+
+
+def ups_risk_cn(risk):
+    return UPS_RISK_CN.get(risk, risk)
+
+
+def ups_conf_kv(path):
+    """读 key=value 型配置（飞牛 device.conf）。读不到返回 None。"""
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                out[k.strip()] = v.strip()
+    except Exception:
+        return None
+    return out
+
+
+def ups_procs_named(names):
+    """按可执行文件名扫 /proc，不依赖 pgrep / psutil。"""
+    want = set(names)
+    out = []
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open("/proc/%s/cmdline" % pid, "rb") as f:
+                    raw = f.read()
+            except Exception:
+                continue
+            if not raw:
+                continue
+            argv0 = raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+            if os.path.basename(argv0) in want:
+                out.append(int(pid))
+    except Exception:
+        pass
+    return sorted(out)
+
+
+def ups_fnos_state():
+    """飞牛自带 UPS 设置的真实状态。"""
+    kv = ups_conf_kv(UPS_NUT_DEVICE_CONF)
+    if kv is None:
+        return {"available": False, "path": UPS_NUT_DEVICE_CONF,
+                "reason": "读不到 %s（应用可能不是 root，或系统未启用 NUT）"
+                          % UPS_NUT_DEVICE_CONF}
+
+    def b(k):
+        return str(kv.get(k, "")).strip().lower() in ("true", "1", "yes", "on")
+
+    try:
+        mtime = int(os.path.getmtime(UPS_NUT_DEVICE_CONF))
+    except Exception:
+        mtime = 0
+    return {"available": True, "path": UPS_NUT_DEVICE_CONF,
+            "enable": b("enable"), "shutdown_ups": b("shutdown-ups.enabled"),
+            "policy_type": kv.get("power-policy.type") or "",
+            "policy_value": kv.get("power-policy.value") or "",
+            "onbatt_min_battery": kv.get("power-policy.onbattMinimumBattery") or "",
+            "device": kv.get("last-device.name") or "", "mtime": mtime}
+
+
+def ups_nut_upsmon_state():
+    """NUT 的 upsmon 是否还能动手。
+
+    光看进程在不在不够：upsmon 必须有 MONITOR 行才知道盯哪台 UPS。MONITOR 被
+    清空时进程仍活着，但手里没有监控对象，永远不会触发关机——飞牛关掉 UPS
+    功能后就是这个状态，不能一律报风险。
+    """
+    out = {"running": False, "pids": [], "readable": False, "monitors": [],
+           "minsupplies": None, "shutdown_cmd": "", "notify_cmd": "",
+           "upssched_ready": False, "upssched_bytes": 0}
+    out["pids"] = ups_procs_named(("upsmon",))
+    out["running"] = bool(out["pids"])
+    lines = []
+    try:
+        with open(UPS_NUT_UPSMON_CONF, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        out["readable"] = True
+    except Exception:
+        lines = []
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        kw, _, rest = s.partition(" ")
+        kw, rest = kw.upper(), rest.strip()
+        if kw == "MINSUPPLIES":
+            try:
+                out["minsupplies"] = int(rest.split()[0])
+            except Exception:
+                pass
+        elif kw == "SHUTDOWNCMD":
+            out["shutdown_cmd"] = rest.strip('"')
+        elif kw == "NOTIFYCMD":
+            out["notify_cmd"] = rest.strip('"')
+        elif kw == "MONITOR":
+            out["monitors"].append(rest)
+    try:
+        with open(UPS_NUT_UPSSCHED_CONF, "r", encoding="utf-8", errors="replace") as f:
+            txt = f.read()
+        out["upssched_bytes"] = len(txt)
+        out["upssched_ready"] = ("CMDSCRIPT" in txt.upper())
+    except Exception:
+        pass
+    return out
+
+
+def ups_guard_conflicts():
+    """汇总「谁还会在低电时动手」。每次调用都重读盘，结果由调用方缓存。"""
+    fn = ups_fnos_state()
+    nut = ups_nut_upsmon_state()
+    items = []
+
+    def add(level, key, title, detail, fix):
+        items.append({"level": level, "key": key, "title": title,
+                      "detail": detail, "fix": fix})
+
+    if fn.get("available"):
+        if fn.get("enable"):
+            add("high", "fnos_enable", "飞牛 UPS 功能开着",
+                "飞牛会接管 /etc/nut/upsmon.conf，改它的设置会重启 nut 服务，"
+                "那一刻 upsc 会失败、读数会断一截；两套逻辑同时判断低电，等于各关一次。",
+                "飞牛「设置 → 硬件与电源 → UPS」里关掉 UPS 支持")
+        if fn.get("shutdown_ups"):
+            add("high", "fnos_shutdown", "飞牛「断电后自动关机」开着",
+                "市电断开后飞牛会按自己的策略关机，当前策略 %s = %s。"
+                "它的判据和时机与本应用完全独立，两边都会想关。"
+                % (fn.get("policy_type") or "（未设置）", fn.get("policy_value") or "0"),
+                "关掉飞牛的断电自动关机，只留一套判断")
+    else:
+        add("warn", "fnos_unknown", "读不到飞牛 UPS 配置",
+            fn.get("reason") or "无法读取 /etc/nut/device.conf",
+            "本应用需要以 root 运行才能做这项检查；请在应用中心确认权限后重启应用")
+
+    if nut.get("running"):
+        mons = nut.get("monitors") or []
+        if mons:
+            add("medium", "nut_upsmon", "NUT 的 upsmon 还在盯着 UPS",
+                "它配了 %d 条 MONITOR，低电时会执行 %s。电池进入低电状态时，"
+                "它可能比本应用更早动手。"
+                % (len(mons), nut.get("shutdown_cmd") or "（未配置关机命令）"),
+                "若只打算由本应用来关，确认飞牛 UPS 关闭后 upsmon 随之停止")
+        else:
+            add("info", "nut_upsmon_idle", "upsmon 在跑但没有监控对象",
+                "进程还在（%d 个），但 upsmon.conf 里一条 MONITOR 都没有——"
+                "它手里没有要盯的 UPS，不会触发关机。" % len(nut.get("pids") or []),
+                "无需处理")
+    if nut.get("upssched_ready"):
+        add("medium", "nut_upssched", "upssched 定时器有脚本",
+            "upssched.conf 里配了 CMDSCRIPT，存在按时间触发的自定义动作，"
+            "常见用法就是「断电 N 分钟后关机」。",
+            "看一眼 /etc/nut/upssched.conf 与它调用的脚本，确认没有重复的关机")
+
+    highs = [i for i in items if i["level"] == "high"]
+    meds = [i for i in items if i["level"] == "medium"]
+    risk = "high" if highs else ("medium" if meds else "none")
+    verdict = {
+        "none": "没检测到别人也在管这台 UPS，本应用可以独自接管关机判断。",
+        "medium": "NUT 里还有会动手的链路，能用，但建议确认后再开「自动关机」。",
+        "high": "飞牛那边的 UPS 保护还开着，两边一起跑会各关一次。先关掉飞牛那侧再启用。",
+    }[risk]
+    return {"checked_at": int(time.time()), "risk": risk, "items": items,
+            "fnos": fn, "nut": nut, "block_shutdown": bool(highs), "verdict_cn": verdict}
+
+
+def ups_conflicts(force=False):
+    """冲突检测 60 秒缓存：每 5 秒一轮不能每次都读三份 conf。"""
+    now = time.time()
+    with _UPS_CONFLICT_LOCK:
+        c = _UPS_CONFLICT_CACHE.get("data")
+        if not force and c and now - float(_UPS_CONFLICT_CACHE.get("ts") or 0) < 60:
+            return c
+        try:
+            c = ups_guard_conflicts()
+        except Exception as e:
+            c = {"checked_at": int(now), "risk": "none", "items": [], "error": str(e),
+                 "block_shutdown": False, "verdict_cn": "冲突检测异常：%s" % e}
+        _UPS_CONFLICT_CACHE["data"] = c
+        _UPS_CONFLICT_CACHE["ts"] = now
+        return c
+
+
+def ups_conflict_blocks(c):
+    """是否应当拒绝「真关机」。risk=high 才算，读不到配置只提示不阻断。"""
+    if not isinstance(c, dict):
+        return False, ""
+    if c.get("risk") != "high":
+        return False, ""
+    fn = c.get("fnos") or {}
+    if fn.get("enable") or fn.get("shutdown_ups"):
+        return True, "飞牛侧 UPS 保护仍开着（%s=%s）" % (
+            fn.get("policy_type") or "策略", fn.get("policy_value") or "0")
+    return True, "检测到飞牛或 NUT 侧仍会在低电时动手"
+
+
+def ups_guard_verdict(bat_v, on_batt, ob_for, cur_state, cfg):
+    """纯函数决策，方便单测。返回 (新状态, 动作, 说明)，动作 ∈ None/reset/cancel/arm。
+
+    两条判据互相独立，任一满足即触发，谁先到算谁：
+      ① 市电断开后持续 >= guard_time_min 分钟仍未恢复
+      ② 电池组电压 <= guard_low_v（默认 22.6V）
+    判据②看电压、不看固件的 battery.charge —— 后者是固件用内阻压降法估的，
+    一带载就从 100% 一步跳到 40%，之后每 15 秒匀速掉 1%，跟真实容量无关。
+    """
+    if not (cfg or {}).get("guard_enabled"):
+        return ("idle", "reset" if cur_state != "idle" else None, "关机保护未启用")
+    if not on_batt:
+        if cur_state == "armed":
+            return ("idle", "cancel", "市电恢复")
+        return ("idle", "reset" if cur_state != "idle" else None, "")
+    # 已进入倒计时 / 已告警：只要还在电池上就不退出，电压回弹也不退。
+    # 铅酸带载时电压随负载波动，跟着它反复进出比不判更危险。
+    if cur_state in ("armed", "alerted"):
+        return (cur_state, None, "")
+
+    need = float((cfg or {}).get("guard_min_ob_s") or 30)
+    tmin = float((cfg or {}).get("guard_time_min") or 10)
+    low_v = float((cfg or {}).get("guard_low_v") or 22.6)
+    if ob_for < need:
+        return ("watching", None, "电池供电 %d 秒，未满 %d 秒确认期" % (ob_for, need))
+    has_v = (bat_v is not None and bat_v > 0)
+    hit_t = ob_for >= tmin * 60
+    hit_v = has_v and bat_v <= low_v
+    if hit_t and hit_v:
+        return ("armed", "arm", "断电已 %s、电池 %.1fV，两条判据都到"
+                % (ups_guard_dur(ob_for), bat_v))
+    if hit_t:
+        return ("armed", "arm", "断电已持续 %s，超过 %s 上限"
+                % (ups_guard_dur(ob_for), ups_guard_dur(tmin * 60)))
+    if hit_v:
+        return ("armed", "arm", "电池 %.1fV 已降到 %.1fV 以下" % (bat_v, low_v))
+    return ("watching", None, "")
+
+
+def ups_guard_audit(data_dir, rec):
+    """关机保护审计：每条一行 JSON，最多留最近 300 条。"""
+    if not data_dir:
+        return
+    try:
+        path = os.path.join(data_dir, UPS_GUARD_AUDIT)
+        rec = dict(rec)
+        rec.setdefault("ts", int(time.time()))
+        rec.setdefault("at", time.strftime("%Y-%m-%d %H:%M:%S"))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            rows = f.readlines()
+        if len(rows) > 300:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(rows[-300:])
+            os.replace(tmp, path)
+    except Exception as e:
+        print("[fnmonitor] 关机保护审计写入失败：%s" % str(e)[:120])
+
+
+class UpsGuard(object):
+    """关机保护状态机。原则：宁可关不掉，也不能关错。
+
+      · 默认关闭，必须手动打开
+      · 必须在电池上连续 guard_min_ob_s 秒才认，防切换抖动
+      · 切换瞬间的无效帧一律不参与判断
+      · 宽限期内来电 / 点取消都能中止
+      · 服务启动后 guard_boot_hold_s 秒内不动手，防重启循环关机
+      · 真正下发前再复核快照新鲜度与两条判据
+      · 只关 NAS，绝不下 load.off 断 UPS 输出（那样来电也无法自启）
+    """
+
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.lock = threading.Lock()
+        self.state = "idle"
+        self.state_since = int(time.time())
+        self.note = ""
+        self.ob_since = None
+        self.armed_at = None
+        self.deadline = None
+        self.fired_at = None
+        self.alert_level = 0
+        self.cancel_until = 0
+        self.boot_at = int(time.time())
+        self.last_fire = self._load_last_fire()
+        # 仅供单测注入假命令，不通过任何 HTTP 接口暴露
+        self.override_cmd = (os.environ.get("FNM_UPS_GUARD_CMD") or "").strip()
+
+    # ---------- 落盘：上次到底关没关 ----------
+    @property
+    def last_path(self):
+        return os.path.join(self.data_dir, UPS_LAST_FILE)
+
+    def _load_last_fire(self):
+        try:
+            with open(self.last_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else None
+        except Exception:
+            return None
+
+    def _save_last_fire(self, d):
+        try:
+            os.makedirs(self.data_dir, exist_ok=True)
+            write_json_secure(self.last_path, d)
+            self.last_fire = d
+        except Exception as e:
+            print("[fnmonitor] 关机记录写入失败：%s" % str(e)[:120])
+
+    def _set(self, st, note=""):
+        if st != self.state:
+            self.state = st
+            self.state_since = int(time.time())
+            ups_guard_audit(self.data_dir, {"action": "state", "to": st, "note": note})
+        if note:
+            self.note = note
+
+    def _reset(self, note=""):
+        if self.state != "idle":
+            ups_guard_audit(self.data_dir, {"action": "state", "to": "idle", "note": note})
+        self.state = "idle"
+        self.state_since = int(time.time())
+        self.deadline = None
+        self.armed_at = None
+        if note:
+            self.note = note
+
+    def status(self, cfg):
+        now = int(time.time())
+        c = ups_conflicts()
+        left = None
+        if self.state == "armed" and self.deadline:
+            left = max(0, int(self.deadline - now))
+        hold = max(0, int(self.boot_at + int((cfg or {}).get("guard_boot_hold_s") or 300) - now))
+        tmin = float((cfg or {}).get("guard_time_min") or 10)
+        ob_for = (now - self.ob_since) if self.ob_since else 0
+        time_left = max(0, int(tmin * 60 - ob_for)) if self.ob_since else None
+        return {"enabled": bool((cfg or {}).get("guard_enabled")),
+                "mode": (cfg or {}).get("guard_mode") or "notify",
+                "time_min": (cfg or {}).get("guard_time_min"),
+                "low_v": (cfg or {}).get("guard_low_v"),
+                "grace_s": (cfg or {}).get("guard_grace_s"),
+                "min_ob_s": (cfg or {}).get("guard_min_ob_s"),
+                "floor_v": UPS_GUARD_FLOOR_V,
+                "boot_hold_s": (cfg or {}).get("guard_boot_hold_s"),
+                "allow_conflict": bool((cfg or {}).get("guard_allow_conflict")),
+                "state": self.state,
+                "state_cn": UPS_GUARD_STATE_CN.get(self.state, self.state),
+                "state_since": self.state_since, "note": self.note,
+                "on_batt_s": ob_for, "time_left_s": time_left, "left_s": left,
+                "deadline": self.deadline, "boot_hold_left": hold,
+                "cancel_left_s": max(0, int(self.cancel_until - now)),
+                "alert_level": self.alert_level, "fired_at": self.fired_at,
+                "last_fire": self.last_fire,
+                "cmd": " ".join(self._resolve_cmd() or []) or "",
+                "conflicts": c}
+
+    def _resolve_cmd(self):
+        if self.override_cmd:
+            return self.override_cmd.split()
+        for cand in (["/sbin/shutdown", "-h", "now"],
+                     ["/usr/sbin/shutdown", "-h", "now"],
+                     ["/bin/systemctl", "poweroff"]):
+            if os.path.exists(cand[0]) and os.access(cand[0], os.X_OK):
+                return cand
+        return None
+
+    def _notify_sync(self, etype, snap, note):
+        """关机前必须同步推：走队列的话进程一死，那条通知就永远发不出去。"""
+        nc = notify_load(self.data_dir)
+        if not (nc.get("enabled") or nc.get("sct_enabled")):
+            return
+        ev = {"type": etype, "ts": int(time.time()), "note": note}
+        try:
+            subject, body = ups_build_msg(ev, snap, self._port())
+            ok, res = notify_send_all(nc, subject, body)
+            print("[fnmonitor] 关机前同步推送%s：%s"
+                  % ("成功" if ok else "失败", str(res)[:160]))
+        except Exception as e:
+            print("[fnmonitor] 关机前同步推送失败：%s" % str(e)[:120])
+
+    def _port(self):
+        try:
+            return int((_UPS_CONFIG or {}).get("port") or 8777) or 8777
+        except Exception:
+            return 8777
+
+    def evaluate(self, snap, cfg):
+        """每个采集周期调一次。返回 True 表示本轮状态有变化。"""
+        if not snap:
+            return False
+        live = snap.get("live") or {}
+        # 切换瞬间的帧（输出电压塌成 0）不参与判断：那时 status 可能刚翻页，
+        # 电量还是上一帧残值，拿它做关机判据最危险。
+        if not live.get("valid", True):
+            return False
+        now = int(time.time())
+        on_batt = bool((live.get("st") or 0) & UPS_BIT_OB)
+        bat_v = live.get("bat_v")
+        with self.lock:
+            if not (cfg or {}).get("guard_enabled"):
+                if self.state != "idle":
+                    self._reset("关机保护已关闭")
+                    return True
+                return False
+            if self.state == "fired":
+                return False
+            if not on_batt:
+                self.cancel_until = 0
+                self.alert_level = 0
+                self.ob_since = None
+            elif self.ob_since is None:
+                self.ob_since = now
+            ob_for = (now - self.ob_since) if self.ob_since else 0
+
+            hold = int((cfg or {}).get("guard_boot_hold_s") or 300)
+            if on_batt and now < self.boot_at + hold and self.state in ("idle", "held"):
+                self._set("held", "服务启动 %d 秒内不动作" % hold)
+                return False
+            if on_batt and now < self.cancel_until and self.state == "idle":
+                self._set("idle", "已手动取消，%d 秒内不再触发" % (self.cancel_until - now))
+                return False
+
+            st, act, note = ups_guard_verdict(bat_v, on_batt, ob_for, self.state, cfg)
+            if act == "cancel":
+                self._cancel(note or "市电恢复，自动取消", snap)
+                return True
+            if act == "reset" and self.state != st:
+                self._reset(note)
+                return True
+            if act == "arm":
+                self._arm(bat_v or 0, ob_for, snap, note, cfg)
+                return True
+            if st != self.state and act is None:
+                self._set(st, note)
+
+            if self.state not in ("armed", "alerted"):
+                return False
+            if self.state == "alerted":
+                if ((cfg or {}).get("guard_mode") or "notify").lower() == "shutdown":
+                    self._fire(snap, cfg, force=True)
+                    return True
+                if self._want_level(bat_v) > self.alert_level:
+                    self._fire(snap, cfg, force=True)
+                return False
+            if not self.deadline:
+                return False
+            # 电压掉到硬下限 → 不再等宽限期
+            if bat_v is not None and 0 < bat_v <= UPS_GUARD_FLOOR_V:
+                tight = min(self.deadline, now + 30)
+                if tight < self.deadline:
+                    self.deadline = tight
+                    print("[fnmonitor] UPS 电池 %.1fV 已到硬下限 %.1fV，宽限期压缩到 30 秒"
+                          % (bat_v, UPS_GUARD_FLOOR_V))
+            if now >= self.deadline:
+                self._fire(snap, cfg)
+                return True
+        return False
+
+    def _arm(self, bat_v, ob_for, snap, why, cfg):
+        grace = max(10, int((cfg or {}).get("guard_grace_s") or 60))
+        self.armed_at = int(time.time())
+        self.deadline = self.armed_at + grace
+        reason = why or ("电池 %.1fV" % (bat_v or 0))
+        # note 只放「为什么触发」，剩余秒数由前端按本地时钟自己算，
+        # 免得界面上出现两个互相打架的倒计时
+        self._set("armed", reason)
+        ups_guard_audit(self.data_dir, {"action": "arm", "why": reason,
+                                        "bat_v": bat_v, "ob_for": ob_for, "grace": grace})
+
+    def _cancel(self, why, snap):
+        had = self.state
+        self._reset(why)
+        self.deadline = None
+        self.alert_level = 0
+        self.note = why
+        ups_guard_audit(self.data_dir, {"action": "cancel", "why": why, "from": had})
+
+    def _want_level(self, bat_v):
+        """1 = 已触发；2 = 电压到硬下限，不再等宽限期。"""
+        return 2 if (bat_v is not None and 0 < bat_v <= UPS_GUARD_FLOOR_V) else 1
+
+    def _fire(self, snap, cfg, force=False):
+        now = int(time.time())
+        live = snap.get("live") or {}
+        age = now - int(snap.get("ts") or 0)
+        if not force:
+            if age > 20:
+                print("[fnmonitor] UPS 关机保护：快照已过期 %d 秒，本轮放弃" % age)
+                return
+            if not (live.get("st") or 0) & UPS_BIT_OB:
+                self._cancel("复核时市电已恢复", snap)
+                return
+            bat_v = live.get("bat_v")
+            low_v = float((cfg or {}).get("guard_low_v") or 22.6)
+            tmin = float((cfg or {}).get("guard_time_min") or 10)
+            ob_for = now - (self.ob_since or now)
+            has_v = (bat_v is not None and bat_v > 0)
+            if not ((has_v and bat_v <= low_v) or ob_for >= tmin * 60):
+                print("[fnmonitor] UPS 关机保护：复核时两条判据都不成立，放弃")
+                return
+
+        bat_v = live.get("bat_v")
+        chg = live.get("chg")           # 仅留档对照，不参与任何判断
+        level = self._want_level(bat_v)
+        mode = ((cfg or {}).get("guard_mode") or "notify").lower()
+        on_s = now - (self.ob_since or now)
+        desc = "电池 %sV、电池供电 %d 秒" % (
+            "?" if bat_v is None else "%.1f" % bat_v, on_s)
+
+        c = ups_conflicts()
+        if mode == "shutdown" and c.get("block_shutdown") and not (cfg or {}).get("guard_allow_conflict"):
+            self._set("blocked", "检测到飞牛侧也管着 UPS，已阻止自动关机")
+            ups_guard_audit(self.data_dir, {"action": "blocked", "why": "conflict",
+                                            "detail": desc})
+            print("[fnmonitor] UPS 关机保护：%s，但飞牛侧仍管着 UPS，本次未执行" % desc)
+            return
+
+        if mode != "shutdown":
+            if not force and level <= self.alert_level:
+                return
+            self.alert_level = level
+            self._set("alerted", "已告警，未关机")
+            ups_guard_audit(self.data_dir, {"action": "alert", "level": level,
+                                            "detail": desc})
+            ups_notify_after_poll([{"type": "GUARD_ALERT", "ts": now, "level": "crit",
+                                    "note": "%s；当前是「只告警」模式，没有关机" % desc}],
+                                  snap, cfg, self.data_dir, self._port())
+            return
+
+        cmd = self._resolve_cmd()
+        if not cmd:
+            self._set("blocked", "找不到 shutdown 命令")
+            ups_guard_audit(self.data_dir, {"action": "blocked", "why": "no_cmd"})
+            print("[fnmonitor] UPS 关机保护：系统里找不到可执行的 shutdown 命令")
+            return
+
+        note = "%s，执行 %s" % (desc, " ".join(cmd))
+        self.fired_at = now
+        self._set("fired", "已下发关机命令")
+        ups_guard_audit(self.data_dir, {"action": "fire", "note": note,
+                                        "bat_v": bat_v, "chg": chg, "on_batt_s": on_s,
+                                        "cmd": " ".join(cmd)})
+        self._notify_sync("GUARD_SHUTDOWN", snap, note)
+        self._save_last_fire({"fired_at": now, "mode": mode, "bat_v": bat_v,
+                              "charge": chg, "on_batt_s": on_s, "cmd": " ".join(cmd),
+                              "in_v": live.get("in_v"), "load": live.get("load")})
+        print("[fnmonitor] UPS 关机保护：%s" % note)
+        # 留几秒让 HTTP 响应与推送跑完，再真的关
+        time.sleep(2)
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+        except Exception as e:
+            print("[fnmonitor] UPS 关机命令执行失败：%s" % str(e)[:120])
+
+    def cancel(self, cfg, why="用户手动取消"):
+        with self.lock:
+            if self.state not in ("armed", "alerted"):
+                return False, "当前没有待执行的关机"
+            self.cancel_until = int(time.time()) + 600
+            snap = ups_latest()
+            self._cancel(why, snap)
+            self._set("idle", "已取消，10 分钟内不再触发")
+            ups_guard_audit(self.data_dir, {"action": "cancel", "why": why, "by": "user"})
+            return True, "已取消"
+
+
+def ups_guard_instance(data_dir):
+    """UpsGuard 单例（懒创建，避免模块导入就建对象）。"""
+    global _UPS_GUARD
+    with _UPS_GUARD_LOCK:
+        if _UPS_GUARD is None or _UPS_GUARD.data_dir != data_dir:
+            _UPS_GUARD = UpsGuard(data_dir)
+        return _UPS_GUARD
+
+
+_UPS_CONFIG = {}          # 采集线程持有的 config 引用（只读 port 等）
+
+
+class UpsPoller(threading.Thread):
+    """NUT 采集线程：upsc 单次 0.1~1 秒、可能超时，绝不放进 10 秒采集主循环。
+
+    未启用时本线程根本不存在（见 ups_poller_ensure）——不 spawn、不调 upsc、
+    不写库、不发通知，这是「未启用零副作用」的唯一保证点。
+    """
+
+    def __init__(self, data_dir, config):
+        threading.Thread.__init__(self, name="fnm-ups", daemon=True)
+        self.data_dir = data_dir
+        self.config = config or {}
+        self._stop = threading.Event()
+        self.last_mask = None
+        self.last_status = ""
+        self.down_since = None
+        self.down_ticks = 0
+        self.down_at = ""
+        self.ups_names = []
+        self.ticks = 0
+        self.started = int(time.time())
+        # 手动「立即刷新」与主循环可能撞车：非阻塞锁，撞上就跳过这一轮
+        self.tick_lock = threading.Lock()
+
+    def stop(self):
+        self._stop.set()
+        _UPS_WAKE.set()
+
+    def run(self):
+        global _UPS_CONFIG
+        _UPS_CONFIG = self.config
+        cfg = ups_load(self.data_dir)
+        # 启动后先静默一个周期，别和采集主循环首轮抢 CPU
+        self._stop.wait(2)
+        while not self._stop.is_set():
+            interval = 5
+            try:
+                cfg = ups_load(self.data_dir)
+                interval = max(3, min(60, int(cfg.get("poll_interval") or 5)))
+                if not cfg.get("enabled"):
+                    self._publish_off()
+                    return
+                self._tick(cfg)
+            except Exception as e:
+                print("[fnmonitor] UPS 采集异常：%s" % str(e)[:160])
+            _UPS_WAKE.wait(interval)
+            _UPS_WAKE.clear()
+
+    # ---------- 单轮 ----------
+    def _tick(self, cfg):
+        if not self.tick_lock.acquire(False):
+            return
+        try:
+            self._once(cfg)
+        finally:
+            self.tick_lock.release()
+
+    def _once(self, cfg):
+        self.ticks += 1
+        snap = None
+        try:
+            name, names = ups_pick(cfg)
+            self.ups_names = names
+            raw = ups_read_vars(name)
+            snap = ups_build(name, raw, cfg)
+        except UpsError as e:
+            self._set_error(e.code, e.message, e.hint)
+            return
+        except Exception as e:
+            self._set_error("error", "读取 UPS 失败：%s" % str(e)[:160], "")
+            return
+
+        # 通信恢复
+        if self.down_since is not None:
+            lost = int(time.time()) - self.down_since
+            ev = [{"ts": int(time.time()), "type": "DEVICE_BACK", "level": "ok",
+                   "label": UPS_EVENT_META["DEVICE_BACK"][0],
+                   "ups": snap["device"].get("name") or "",
+                   "from_st": self.down_at, "to_st": snap["live"].get("status") or "",
+                   "chg": snap["live"].get("chg"), "rt": snap["live"].get("rt"),
+                   "in_v": snap["live"].get("in_v"), "out_v": snap["live"].get("out_v"),
+                   "load": snap["live"].get("load"), "temp": snap["live"].get("temp"),
+                   "note": "通信恢复（失联 %s，丢失 %d 帧）"
+                           % (ups_guard_dur(lost), self.down_ticks)}]
+            self.down_since = None
+            self.down_ticks = 0
+            self.down_at = ""
+            ups_notify_after_poll(ev, snap, cfg, self.data_dir, self._port())
+
+        evs = ups_detect(self, snap)
+        snap["state"] = "ok"
+        snap["ok"] = True
+        snap["enabled"] = 1
+        snap["stale"] = 0
+        snap["error"] = ""
+        snap["ups_list"] = list(self.ups_names)
+        snap["poll"] = cfg.get("poll_interval")
+        snap["uptime"] = int(time.time()) - self.started
+        self._publish(snap)
+
+        # 即使本轮没有新事件也要调：pending 队列的重投只能靠这条路径驱动
+        # （边沿事件不会自己再出现，失败的通知必须由后续空轮次捞起来）
+        ups_notify_after_poll(evs, snap, cfg, self.data_dir, self._port())
+        try:
+            ups_guard_instance(self.data_dir).evaluate(snap, cfg)
+        except Exception as e:
+            print("[fnmonitor] UPS 关机保护判定异常：%s" % str(e)[:160])
+
+    def _port(self):
+        try:
+            return int(self.config.get("port") or 8777) or 8777
+        except Exception:
+            return 8777
+
+    def _set_error(self, code, msg, hint=""):
+        """通信失败：保留上一帧 live，但标明数据不是当前值。
+
+        只在本轮之前是正常态时落一条 DEVICE_LOST——之后每轮只累加计数，
+        不然一次掉线会刷出几十条重复事件。
+        """
+        now = int(time.time())
+        old = ups_latest()
+        snap = {"ok": False, "enabled": 1, "state": code or "error", "ts": now,
+                "stale": 1, "error": msg, "hint": hint or "",
+                "device": old.get("device") or {}, "live": old.get("live") or {},
+                "health": old.get("health") or {}, "ups_list": list(self.ups_names),
+                "poll": None, "uptime": int(time.time()) - self.started}
+        if snap["live"]:
+            snap["live"] = dict(snap["live"])
+            snap["live"]["stale"] = 1
+        elif hint:
+            snap["note"] = hint
+        if self.down_since is None:
+            self.down_since = now
+            self.down_ticks = 0
+            self.down_at = (old.get("live") or {}).get("status") or ""
+            ev = {"ts": now, "type": "DEVICE_LOST", "level": "crit",
+                  "label": UPS_EVENT_META["DEVICE_LOST"][0],
+                  "ups": (old.get("device") or {}).get("name") or "",
+                  "from_st": self.down_at, "to_st": "", "chg": None, "rt": None,
+                  "in_v": None, "out_v": None, "load": None, "temp": None,
+                  "note": "%s%s" % (msg, ("（%s）" % hint) if hint else "")}
+            ups_notify_after_poll([ev], snap, ups_load(self.data_dir),
+                                  self.data_dir, self._port())
+        else:
+            self.down_ticks += 1
+        self._publish(snap)
+
+    def _publish(self, snap):
+        with _UPS_LOCK:
+            _UPS_LATEST.clear()
+            _UPS_LATEST.update(snap)
+
+    def _publish_off(self):
+        with _UPS_LOCK:
+            _UPS_LATEST.clear()
+
+
+def ups_latest():
+    """最近一帧快照（浅拷贝）。HTTP 与历史写库都只读这份内存。"""
+    with _UPS_LOCK:
+        return dict(_UPS_LATEST)
+
+
+def ups_off_snapshot(cfg):
+    """未启用时的固定结构：保证 /api/ups 契约稳定，且不 stat 任何文件。"""
+    return {"ok": False, "enabled": 0, "state": "off", "ts": 0, "stale": 0,
+            "error": "", "hint": "", "device": {}, "live": {}, "health": {},
+            "guard": {}, "config": ups_public(cfg or UPS_DEFAULT),
+            "upsc": "", "ups_list": []}
+
+
+def ups_public(cfg):
+    """对外配置：无密钥字段，可整份回传。附 upsc 路径与 NUT 状态。"""
+    out = dict(cfg or UPS_DEFAULT)
+    out["events_meta"] = [{"code": k, "label": v[0], "level": v[1]}
+                          for k, v in UPS_EVENT_META.items()]
+    out["choices"] = list(UPS_NOTIFY_CHOICES)
+    out["floor_v"] = UPS_GUARD_FLOOR_V
+    out["upsc"] = ups_upsc()
+    snap = ups_latest()
+    out["nut_state"] = snap.get("state") or ("off" if not out.get("enabled") else "init")
+    out["nut_error"] = snap.get("error") or ""
+    return out
+
+
+def ups_save(data_dir, data):
+    """合并保存。危险组合（真关机 + 飞牛也在管）直接拒绝且不落盘。"""
+    cur = ups_load(data_dir)
+    cfg = ups_normalize(data or {}, base=cur)
+    if (cfg.get("guard_enabled") and (cfg.get("guard_mode") or "") == "shutdown"
+            and not cfg.get("guard_allow_conflict")):
+        c = ups_conflicts(force=True)
+        blocked, why = ups_conflict_blocks(c)
+        if blocked:
+            ups_guard_audit(data_dir, {"action": "save", "result": "blocked",
+                                       "why": why})
+            return cur, ("飞牛侧还在管这台 UPS（%s），先关掉它再启用真关机；"
+                         "或勾选「我已知冲突风险」" % why)
+    write_json_secure(os.path.join(data_dir, UPS_FILE), cfg)
+    ups_guard_audit(data_dir, {"action": "save", "result": "ok",
+                               "guard": cfg.get("guard_enabled"),
+                               "mode": cfg.get("guard_mode")})
+    _UPS_WAKE.set()
+    try:
+        ups_poller_ensure(data_dir, _UPS_CONFIG or {})
+    except Exception as e:
+        print("[fnmonitor] UPS 线程启停异常：%s" % str(e)[:120])
+    return cfg, ""
+
+
+def ups_poller_ensure(data_dir, config):
+    """按配置启停采集线程。未启用 → 返回 None，绝不建线程。"""
+    global _UPS_POLLER, _UPS_CONFIG
+    cfg = ups_load(data_dir)
+    if config:
+        _UPS_CONFIG = config
+    with _UPS_POLLER_LOCK:
+        if not cfg.get("enabled"):
+            if _UPS_POLLER is not None:
+                _UPS_POLLER.stop()
+                _UPS_POLLER = None
+            with _UPS_LOCK:
+                _UPS_LATEST.clear()
+            return None
+        if _UPS_POLLER is not None and _UPS_POLLER.is_alive():
+            _UPS_WAKE.set()
+            return _UPS_POLLER
+        _UPS_POLLER = UpsPoller(data_dir, config)
+        _UPS_POLLER.start()
+        return _UPS_POLLER
+
+
+def ups_poller_stop():
+    global _UPS_POLLER
+    with _UPS_POLLER_LOCK:
+        if _UPS_POLLER is not None:
+            _UPS_POLLER.stop()
+            _UPS_POLLER = None
+    with _UPS_LOCK:
+        _UPS_LATEST.clear()
+
+
 def read_net_dev():
     """读取 /proc/net/dev，返回接口累计字节。"""
     out = {}
@@ -8546,6 +10208,19 @@ class Collector(threading.Thread):
             valid_rpm = [f["rpm"] for f in fans if f.get("rpm")]
             if valid_rpm:
                 rows.append((now, "fan_avg", _r2(sum(valid_rpm) / len(valid_rpm))))
+            # ---- UPS（历史维度）：与 /api/ups 同源，仅已启用且本轮是有效帧 ----
+            # 写库同样受休眠盘保护（下方 path_on_standby 分支统一暂存），
+            # 被保护的从来不是数据来源，而是「写 monitor.db 会唤醒数据盘」这件事。
+            _ups = ups_latest()
+            _ulive = (_ups.get("live") or {})
+            if _ups.get("enabled") and _ulive and _ulive.get("valid", True):
+                for _met, _key in (("ups_load", "load"), ("ups_chg", "chg"),
+                                   ("ups_rt", "rt"), ("ups_in_v", "in_v"),
+                                   ("ups_out_v", "out_v"), ("ups_bat_v", "bat_v"),
+                                   ("ups_temp", "temp")):
+                    _v = _ulive.get(_key)
+                    if _v is not None:
+                        rows.append((now, _met, _r2(_v)))
             # ---- 磁盘 IO（历史维度：读/写 MB/s） ----
             for it in diskio:
                 rows.append((now, "diskio_r:" + str(it.get("name", "?")),
@@ -9173,6 +10848,8 @@ class MonitorApp:
                      "/api/vm/action", "/api/config/save", "/api/update/install",
                      "/api/notify/save", "/api/notify/test", "/api/disk_scan/now",
                      "/api/idrac/save", "/api/idrac/test", "/api/idrac/refresh",
+                     "/api/ups/save", "/api/ups/guard/save", "/api/ups/guard/cancel",
+                     "/api/ups/guard/sim", "/api/ups/collect", "/api/ups/notify/test",
                      "/api/scan_log/clear"}
 
         class Handler(BaseHTTPRequestHandler):
@@ -9398,6 +11075,16 @@ class MonitorApp:
                     return
                 if path == "/api/idrac/sel":
                     self._json(app.api_idrac_sel(qs))
+                    return
+                if path == "/api/ups":
+                    self._json(app.api_ups())
+                    return
+                if path == "/api/ups/events":
+                    self._json(app.api_ups_events((qs.get("limit") or ["50"])[0]))
+                    return
+                if path == "/api/ups/guard":
+                    self._json(app.api_ups_guard(
+                        (qs.get("force") or ["0"])[0] in ("1", "true", "yes")))
                     return
                 if path == "/api/docker":
                     self._json(app.api_docker())
@@ -9643,6 +11330,24 @@ class MonitorApp:
                     return
                 if path == "/api/idrac/refresh":
                     self._json(app.api_idrac_refresh_static())
+                    return
+                if path == "/api/ups/save":
+                    self._json(app.api_ups_save(data))
+                    return
+                if path == "/api/ups/guard/save":
+                    self._json(app.api_ups_guard_save(data))
+                    return
+                if path == "/api/ups/guard/cancel":
+                    self._json(app.api_ups_guard_cancel())
+                    return
+                if path == "/api/ups/guard/sim":
+                    self._json(app.api_ups_guard_sim(data))
+                    return
+                if path == "/api/ups/collect":
+                    self._json(app.api_ups_collect())
+                    return
+                if path == "/api/ups/notify/test":
+                    self._json(app.api_ups_notify_test())
                     return
                 if path == "/api/disk_scan/now":
                     self._json(app.api_disk_scan_now())
@@ -10106,6 +11811,14 @@ class MonitorApp:
                 fans = snap.get("sensors", {}).get("fans", [])
                 rpms = [f.get("rpm") for f in fans if f.get("rpm")]
                 return round(sum(rpms) / len(rpms), 1) if rpms else None
+            if metric.startswith("ups_"):
+                # UPS 不在采集主快照里，单独读它那份内存快照
+                live = ups_latest().get("live") or {}
+                if not live or live.get("valid") is False:
+                    return None
+                return live.get({"ups_load": "load", "ups_chg": "chg", "ups_rt": "rt",
+                                 "ups_in_v": "in_v", "ups_out_v": "out_v",
+                                 "ups_bat_v": "bat_v", "ups_temp": "temp"}.get(metric, ""))
         except Exception:
             pass
         return None
@@ -10696,6 +12409,135 @@ class MonitorApp:
     def api_power(self):
         """实时功耗（RAPL）。"""
         return self.collector.get_snapshot().get("power", {"ok": False})
+
+    # ---------- UPS 电源 ----------
+    def api_ups(self):
+        """UPS 实时快照。未启用时返回固定结构（值全空），保证契约稳定。"""
+        cfg = ups_load(self.data_dir)
+        if not cfg.get("enabled"):
+            return ups_off_snapshot(cfg)
+        snap = ups_latest()
+        if not snap:
+            out = ups_off_snapshot(cfg)
+            out.update({"enabled": 1, "state": "init", "config": ups_public(cfg),
+                        "upsc": ups_upsc()})
+            return out
+        out = dict(snap)
+        out["config"] = ups_public(cfg)
+        out["upsc"] = ups_upsc()
+        out["guard"] = ups_guard_instance(self.data_dir).status(cfg)
+        out["age_s"] = max(0, int(time.time() - int(snap.get("ts") or 0)))
+        return out
+
+    def api_ups_events(self, limit=50):
+        """UPS 事件列表（最新在前）。limit 夹在 1~200。"""
+        try:
+            n = int(limit)
+        except Exception:
+            n = 50
+        evs, total = ups_events_load(self.data_dir, n)
+        return {"ok": True, "events": evs, "total": total}
+
+    def api_ups_guard(self, force=False):
+        """关机保护状态 + 冲突检测（60 秒缓存，force 强制重读 conf）。"""
+        cfg = ups_load(self.data_dir)
+        g = ups_guard_instance(self.data_dir).status(cfg)
+        if force:
+            g["conflicts"] = ups_conflicts(True)
+        return g
+
+    def api_ups_save(self, data):
+        """保存 UPS 配置。真关机 + 飞牛也在管 → 拒绝且不落盘。"""
+        cfg, err = ups_save(self.data_dir, data)
+        out = {"ok": not err, "error": err or "", "config": ups_public(cfg)}
+        if not err:
+            out["message"] = "已保存"
+            self._overview_bytes = b""
+        return out
+
+    def api_ups_guard_save(self, data):
+        """关机保护单独保存（字段同 /api/ups/save，只是入口分开便于审计）。"""
+        return self.api_ups_save(data)
+
+    def api_ups_guard_cancel(self):
+        """取消待执行的关机，并进入 600 秒静默。"""
+        cfg = ups_load(self.data_dir)
+        ok, msg = ups_guard_instance(self.data_dir).cancel(cfg)
+        return {"ok": ok, "message": msg}
+
+    def api_ups_guard_sim(self, data):
+        """关机判定演练：只跑纯函数，绝不 arm / fire / 下发命令。
+
+        两条判据在真断电前无法验证，改完参数只能等下次停电——这是所有高危
+        配置里最不该缺的验证手段，所以留这个入口。
+        """
+        cfg = ups_load(self.data_dir)
+        data = data or {}
+        try:
+            start_v = float(data.get("start_v") if data.get("start_v") is not None
+                            else cfg.get("guard_low_v") + 3.4)
+        except Exception:
+            start_v = float(cfg.get("guard_low_v") or 22.6) + 3.4
+        start_v = max(20.0, min(60.0, start_v))
+        span = max(60, int(float(cfg.get("guard_time_min") or 10) * 60 * 1.5))
+        step = 5
+        bat_lo = 20.0
+        st = "idle"
+        arm_at = arm_v = None
+        for i, ob in enumerate(range(0, span + step, step)):
+            frac = ob / float(span)
+            bat_v = round(start_v - (start_v - bat_lo) * frac, 2)
+            new_st, act, note = ups_guard_verdict(bat_v, True, ob, st, cfg)
+            if act == "arm":
+                arm_at, arm_v, st = ob, bat_v, new_st
+                break
+            st = new_st
+        mode = (cfg.get("guard_mode") or "notify").lower()
+        would = "none"
+        if arm_at is not None:
+            would = "shutdown" if (mode == "shutdown" and cfg.get("guard_enabled")) else "notify"
+        return {"ok": True, "enabled": bool(cfg.get("guard_enabled")), "mode": mode,
+                "would": would, "arm_at_s": arm_at, "arm_v": arm_v,
+                "start_v": start_v, "span_s": span,
+                "note": ("关机保护未启用，演练只算不动作" if not cfg.get("guard_enabled")
+                         else ("按当前参数：断电 %s 后电池 %.1fV 触发%s"
+                               % (ups_guard_dur(arm_at or 0), arm_v or 0,
+                                  "真关机" if would == "shutdown" else "告警"))
+                         if arm_at is not None else "按当前参数，这段电压下降过程内不会触发")}
+
+    def api_ups_collect(self):
+        """立即采集一次（不等轮询周期）。"""
+        cfg = ups_load(self.data_dir)
+        if not cfg.get("enabled"):
+            return {"ok": False, "error": "UPS 监控未启用"}
+        p = _UPS_POLLER
+        if p is None or not p.is_alive():
+            return {"ok": False, "error": "采集线程未运行，请重新保存启用开关"}
+        try:
+            p._tick(cfg)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:160]}
+        return {"ok": True, "message": "已刷新", "ups": ups_latest()}
+
+    def api_ups_notify_test(self):
+        """发一条 UPS 样例告警，验证统一通知通道（走 notify_send_all）。"""
+        nc = notify_load(self.data_dir)
+        if not (nc.get("enabled") or nc.get("sct_enabled")):
+            return {"ok": False, "error": "请先在 设置 → 通知 里开启邮件或微信并保存"}
+        snap = ups_latest()
+        if not snap:
+            snap = {"device": {"mfr": "示例", "model": "UPS", "serial": "—"},
+                    "live": {"bat_v": 25.6}}
+        ev = {"type": "POWER_LOSS", "ts": int(time.time()),
+              "level": "crit", "label": UPS_EVENT_META["POWER_LOSS"][0],
+              "from_st": "OL CHRG", "to_st": "OB DISCHRG", "chg": 88, "rt": 900,
+              "in_v": 0, "out_v": 220, "load": 31, "temp": 24.5,
+              "note": "这是一条测试消息：市电中断，切换电池供电"}
+        subject, body = ups_build_msg(ev, snap, int(self.config.get("port") or 8777) or 8777)
+        subject = "【测试】" + subject
+        ok, res = notify_send_all(nc, subject, body)
+        return {"ok": ok, "channels": res,
+                "error": "" if ok else "发送失败：" + str(res)[:160]}
 
     def api_traffic(self):
         """流量统计：实时速率 + 各网卡累计/丢包/错误 + 今日/本月/开机累计 + 容器流量 TOP。"""
@@ -12042,11 +13884,18 @@ def main():
     idrac_slow = IdracSlowPoller(app.collector.data_dir)
     idrac_slow.start()
 
+    # UPS 采集线程：未启用时 ups_poller_ensure 直接返回 None，不建线程、不调 upsc
+    ups_poller = ups_poller_ensure(app.collector.data_dir, app.config)
+
     def shutdown(sig, frame):
         app.collector.stop()
         scanner.stop()
         idrac_poller.stop()
         idrac_slow.stop()
+        try:
+            ups_poller_stop()
+        except Exception:
+            pass
         threading.Thread(target=httpd.shutdown, daemon=True).start()
         sys.exit(0)
 

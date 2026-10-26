@@ -22,7 +22,9 @@ SAFE_GETS = ["/", "/index.html", "/login.html", "/api/overview", "/api/docker", 
              "/api/power_stats", "/api/gpu", "/api/gpu?diag=1", "/api/memory", "/api/monthly_summary",
              "/api/daily", "/api/daily?days=400", "/api/report", "/api/report?format=html", "/api/auth/config",
              "/api/auth/session", "/api/export?type=status", "/api/export?type=history&range=24h",
-             "/api/export?type=traffic&range=24h", "/api/export?type=power&range=24h"] + \
+             "/api/export?type=traffic&range=24h", "/api/export?type=power&range=24h",
+             # UPS：未启用时必须返回完整的「关闭态」结构，且不 stat /etc/nut、不调 upsc
+             "/api/ups", "/api/ups/events", "/api/ups/guard"] + \
             ["/api/history?metric=%s&range=%s" % (m, r) for m in ("cpu", "mem", "temp", "power", "net", "net_bytes",
                                                                   "ctr_in", "diskio", "disk_total", "load1")
              for r in ("1h", "all")]
@@ -121,7 +123,10 @@ class NoAuthTest(ServerTestCase):
     def test_get_on_state_changing_endpoints_405(self):
         for p in ("/api/update/install", "/api/update/download", "/api/update/download?to=nas&path=/tmp",
                   "/api/config/save", "/api/auth/setup", "/api/auth/password", "/api/auth/logout", "/api/docker/action",
-                  "/api/vm/action"):
+                  "/api/vm/action",
+                  # UPS：含一个能真下发关机命令的入口，必须只接受 POST
+                  "/api/ups/save", "/api/ups/guard/save", "/api/ups/guard/cancel",
+                  "/api/ups/guard/sim", "/api/ups/collect", "/api/ups/notify/test"):
             st, j, r, _ = self.get(p)
             self.assertEqual((st, r.getheader("Allow")), (405, "POST"), p)
             self.assertEqual(j["error"], "method_not_allowed")
@@ -343,6 +348,159 @@ class NoAuthTest(ServerTestCase):
             with self.subTest(path=p):
                 self.assertIn(st, (200,), p)
                 assert_no_secret(self, p, b)
+
+
+class UpsTest(ServerTestCase):
+    """UPS 接口：未启用时必须零副作用，启用后无 NUT 要优雅降级。"""
+
+    def ups_save(self, patch, **kw):
+        return self.post("/api/ups/save", patch, **kw)
+
+    def test_ups_disabled_is_complete_and_side_effect_free(self):
+        st, j, *_ = self.get("/api/ups")
+        self.assertEqual(st, 200)
+        self.assertEqual((j["ok"], j["enabled"], j["state"]), (False, 0, "off"))
+        for k in ("ts", "stale", "error", "hint", "device", "live", "health", "guard",
+                  "config", "upsc", "ups_list"):
+            self.assertIn(k, j)
+        self.assertEqual(j["live"], {})
+        cfg = j["config"]
+        for k in ("events_meta", "choices", "floor_v", "nut_state", "guard_low_v",
+                  "notify_events", "guard_mode"):
+            self.assertIn(k, cfg)
+        self.assertEqual(cfg["floor_v"], 21.4)
+        self.assertEqual(cfg["nut_state"], "off")
+        # 「未启用零副作用」：不建线程 → 不调 upsc → 不写任何 UPS 文件
+        for name in ("ups_events.jsonl", "ups_state.json", "ups_guard.jsonl",
+                     "ups_guard_last.json"):
+            self.assertFalse(os.path.exists(os.path.join(self.srv.data, name)), name)
+        self.assertNotIn("upsc", self.srv.log())
+
+    def test_ups_guard_status_shape(self):
+        st, j, *_ = self.get("/api/ups/guard")
+        self.assertEqual(st, 200)
+        for k in ("enabled", "mode", "state", "state_cn", "floor_v", "conflicts",
+                  "boot_hold_left", "cancel_left_s", "cmd"):
+            self.assertIn(k, j)
+        self.assertFalse(j["enabled"])
+        self.assertEqual(j["state"], "idle")
+        self.assertEqual(j["floor_v"], 21.4)
+        c = j["conflicts"]
+        for k in ("risk", "items", "fnos", "nut", "block_shutdown", "verdict_cn"):
+            self.assertIn(k, c)
+        self.assertFalse(c["block_shutdown"])       # 读不到配置只提示，绝不阻断
+        self.assertIn(c["risk"], ("none", "medium", "high"))
+        st, j2, *_ = self.get("/api/ups/guard?force=1")
+        self.assertEqual(st, 200)
+        self.assertIn("conflicts", j2)
+
+    def test_ups_events_list(self):
+        st, j, *_ = self.get("/api/ups/events")
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        self.assertIsInstance(j["events"], list)
+        self.assertIsInstance(j["total"], int)
+        for ev in j["events"]:
+            self.assertIn("type", ev)
+            self.assertIn("ts", ev)
+        st, j, *_ = self.get("/api/ups/events?limit=abc")
+        self.assertEqual(st, 200)
+
+    def test_ups_posts_require_csrf_header(self):
+        for p in ("/api/ups/save", "/api/ups/guard/cancel", "/api/ups/collect",
+                  "/api/ups/guard/sim"):
+            st, j, _, _ = self.srv.request("POST", p, {"enabled": 0},
+                                           {"Content-Type": "application/json"})
+            self.assertEqual((st, j["error"]), (403, "csrf_rejected"), p)
+
+    def test_ups_save_clamps_and_reports_back(self):
+        st, j, *_ = self.ups_save({"enabled": 0, "guard_low_v": 15, "poll_interval": 1,
+                                   "notify_events": ["POWER_LOSS", "BOGUS"],
+                                   "notify_quiet": "junk", "guard_mode": "rm -rf /",
+                                   "battery_dod": 5})
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"], j)
+        cfg = j["config"]
+        self.assertEqual(cfg["guard_low_v"], 21.4)      # 硬下限抬回来
+        self.assertEqual(cfg["poll_interval"], 3)
+        self.assertEqual(cfg["notify_events"], ["POWER_LOSS"])
+        self.assertEqual(cfg["notify_quiet"], "")
+        self.assertEqual(cfg["guard_mode"], "notify")
+        self.assertEqual(cfg["battery_dod"], 1.0)
+        # 落盘且能回读
+        self.assertEqual(self.get("/api/ups")[1]["config"]["guard_low_v"], 21.4)
+        st, j, *_ = self.post("/api/ups/guard/save", {"enabled": 0, "poll_interval": 5})
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["config"]["poll_interval"], 5)
+
+    def test_ups_sim_is_pure(self):
+        self.ups_save({"enabled": 0, "guard_enabled": 1, "guard_mode": "shutdown",
+                       "guard_time_min": 10, "guard_low_v": 22.6})
+        st, j, *_ = self.post("/api/ups/guard/sim", {"start_v": 27.0})
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        for k in ("enabled", "mode", "would", "arm_at_s", "arm_v", "start_v", "note"):
+            self.assertIn(k, j)
+        self.assertEqual(j["mode"], "shutdown")
+        self.assertIn(j["would"], ("none", "notify", "shutdown"))
+        # 演练绝不能产生任何动作：状态仍是 idle，也没有审计/关机记录
+        g = self.get("/api/ups/guard")[1]
+        self.assertEqual(g["state"], "idle")
+        self.assertIsNone(g["fired_at"])
+        self.assertFalse(os.path.exists(os.path.join(self.srv.data, "ups_guard_last.json")))
+        self.ups_save({"guard_enabled": 0, "guard_mode": "notify"})
+
+    def test_ups_collect_rejected_when_disabled(self):
+        self.ups_save({"enabled": 0})
+        st, j, *_ = self.post("/api/ups/collect", {})
+        self.assertEqual(st, 200)
+        self.assertFalse(j["ok"])
+
+    def test_ups_cancel_without_pending(self):
+        st, j, *_ = self.post("/api/ups/guard/cancel", {})
+        self.assertEqual(st, 200)
+        self.assertFalse(j["ok"])
+        self.assertIn("没有待执行", j["message"])
+
+    def test_ups_notify_test_needs_channel(self):
+        st, j, *_ = self.post("/api/ups/notify/test", {})
+        self.assertEqual(st, 200)
+        self.assertFalse(j["ok"])
+        self.assertIn("通知", j["error"])
+
+    def test_ups_no_history_rows_when_disabled(self):
+        for m in ("ups_load", "ups_chg", "ups_rt", "ups_in_v", "ups_out_v",
+                  "ups_bat_v", "ups_temp"):
+            j = self.get("/api/history?metric=%s&range=1h" % m)[1]
+            self.assertEqual(j["metric"], m)
+            self.assertIsInstance(j["points"], list)
+
+    def test_ups_enable_without_nut_degrades_gracefully(self):
+        """启用但系统没装 NUT：不崩、不刷屏，state 明确告知原因与处理办法。"""
+        st, j, *_ = self.ups_save({"enabled": 1, "poll_interval": 3})
+        self.assertTrue(j["ok"], j)
+        state = None
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            j = self.get("/api/ups")[1]
+            if j["state"] not in ("off", "init"):
+                state = j
+                break
+            time.sleep(0.5)
+        self.assertIsNotNone(state, "poller 没有在 30 秒内产出状态：\n%s" % self.srv.log())
+        # Windows / 无 NUT 环境 → no_nut；装了 NUT 但没设备 → no_device。都不是 ok
+        self.assertIn(state["state"], ("no_nut", "no_device", "error", "stale"))
+        self.assertTrue(state["error"])
+        self.assertEqual(state["enabled"], 1)
+        self.assertEqual(state["stale"], 1)
+        # 掉线要落事件流水，而不是静默失败
+        evs = self.get("/api/ups/events")[1]["events"]
+        self.assertTrue(any(e["type"] == "DEVICE_LOST" for e in evs), evs)
+        # 停用后干净回到 off
+        self.ups_save({"enabled": 0})
+        j = self.get("/api/ups")[1]
+        self.assertEqual((j["enabled"], j["state"]), (0, "off"))
+        self.assertEqual(j["live"], {})
 
 
 class AuthFlowTest(ServerTestCase):

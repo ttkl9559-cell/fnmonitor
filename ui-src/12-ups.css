@@ -1,0 +1,49 @@
+/* =====================================================================
+   UPS 电源页 — 状态条、事件时间线、设置分组内的补充样式
+   全部用 token，深浅色自动适配（不要在这里写死颜色）
+   ===================================================================== */
+
+/* ---- 状态胶囊 ---- */
+.ups-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 var(--s4); }
+.ups-chips .pill { white-space: nowrap; }
+
+/* ---- 关机保护条（页面级常驻，不可隐藏） ---- */
+.ups-guard { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; margin: 0 0 var(--s5); padding: 10px var(--s4); border-radius: var(--r-md); background: var(--card); border: 1px solid var(--line); font-size: var(--fs-sm); }
+.ups-guard b { font-weight: 600; }
+.ups-guard .ug-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; }
+.ups-guard .ug-note { color: var(--ink-3); font-size: var(--fs-xs); }
+.ups-guard .ug-count { font-family: var(--font-mono); font-size: var(--fs-h3); margin-left: auto; letter-spacing: .02em; }
+.ups-guard[data-tone="warn"] { border-color: var(--warn-fill); background: var(--warn-soft); }
+.ups-guard[data-tone="warn"] .ug-dot { background: var(--warn-fill); }
+.ups-guard[data-tone="crit"] { border-color: var(--crit); background: var(--crit-soft); }
+.ups-guard[data-tone="crit"] .ug-dot { background: var(--crit); animation: ug-pulse 1.6s var(--ease) infinite; }
+@keyframes ug-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* ---- 概览：健康分与说明 ---- */
+.up-score { margin: 4px 0 2px; }
+.up-basis { margin: 6px 0 0; font-size: var(--fs-sm); color: var(--ink-2); line-height: 1.65; }
+.up-notes { margin: 8px 0 0; padding-left: 16px; font-size: var(--fs-xs); color: var(--ink-3); line-height: 1.7; }
+
+/* ---- 事件时间线 ---- */
+.up-ev { padding-top: 4px; padding-bottom: 4px; }
+.ev-row { display: grid; grid-template-columns: 92px 92px minmax(0, 1fr) auto; align-items: baseline; gap: var(--s3); padding: 8px 0; border-top: 1px solid var(--line); font-size: var(--fs-sm); }
+.ev-row:first-child { border-top: 0; }
+.ev-ts { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--ink-3); white-space: nowrap; }
+.ev-tag { font-weight: 600; white-space: nowrap; }
+.ev-row[data-lv="crit"] .ev-tag { color: var(--crit); }
+.ev-row[data-lv="warn"] .ev-tag { color: var(--warn-fill); }
+.ev-row[data-lv="ok"] .ev-tag { color: var(--ok); }
+.ev-note { color: var(--ink-2); overflow-wrap: anywhere; }
+.ev-meta { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--ink-3); white-space: nowrap; }
+@media (max-width: 640px) {
+  .ev-row { grid-template-columns: 1fr auto; row-gap: 2px; }
+  .ev-ts { grid-column: 1; }
+  .ev-meta { grid-column: 2; text-align: right; }
+  .ev-tag, .ev-note { grid-column: 1 / -1; }
+}
+
+/* ---- 设置分组：事件选择与操作按钮 ---- */
+.up-evs { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-start; }
+.up-acts { display: inline-flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.up-warn { display: flex; gap: 6px; align-items: flex-start; margin: 10px 0 2px; color: var(--warn-fill); }
+.up-conf { display: grid; gap: 4px; justify-items: start; }

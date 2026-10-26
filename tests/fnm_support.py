@@ -212,7 +212,7 @@ def cookie_of(resp):
 CONTRACT_ENDPOINTS = [
     "/api/overview", "/api/config", "/api/docker", "/api/history?metric=cpu&range=1h",
     "/api/traffic", "/api/power_stats", "/api/daily", "/api/monthly_summary", "/api/ui",
-    "/api/auth/config", "/api/vms",
+    "/api/auth/config", "/api/vms", "/api/ups", "/api/ups/guard",
 ]
 # Sub-trees whose content depends on the host hardware / platform (lists of disks, sensors…).
 # Only their own type is checked, not their inner keys.
@@ -224,6 +224,10 @@ OPAQUE_PATHS = {
     "/api/vms": ["vms"],
     "/api/traffic": ["ifaces", "containers"],
     "/api/power_stats": ["disks", "realtime"],
+    # UPS 未启用时唯一有内容的只有 config；events_meta 是固定 11 项的常量表
+    "/api/ups": ["config.events_meta"],
+    # 冲突检测结果随宿主机的 /etc/nut 与进程表变化，结构不能进契约
+    "/api/ups/guard": ["conflicts"],
 }
 # Keys that legitimately exist only on some hosts (compare-path syntax).
 OPTIONAL_KEYS = {

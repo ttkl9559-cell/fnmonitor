@@ -13,6 +13,7 @@
       <button role="tab" type="button" data-page="overview" aria-selected="true">总览</button>
       <button role="tab" type="button" data-page="docker" aria-selected="false">容器</button>
       <button role="tab" type="button" data-page="vms" aria-selected="false" hidden>虚拟机</button>
+      <button role="tab" type="button" data-page="ups" aria-selected="false" hidden>电源</button>
       <button role="tab" type="button" data-page="settings" aria-selected="false">设置</button>
     </nav>
     <div class="tools">
@@ -39,6 +40,10 @@
   <section class="page" id="page-vms" data-page="vms" aria-label="虚拟机" hidden>
     <div class="layout" data-layout="vms" id="layout-vms"></div>
   </section>
+  <section class="page" id="page-ups" data-page="ups" aria-label="电源" hidden>
+    <div id="upsGuard"></div>
+    <div class="layout" data-layout="ups" id="layout-ups"></div>
+  </section>
   <section class="page" id="page-settings" data-page="settings" aria-label="设置" hidden>
     <div class="page-head">
       <div>
@@ -57,6 +62,7 @@
   <button type="button" data-page="overview" aria-selected="true"><svg class="i"><use href="#i-home"/></svg>总览</button>
   <button type="button" data-page="docker" aria-selected="false"><svg class="i"><use href="#i-box"/></svg>容器</button>
   <button type="button" data-page="vms" aria-selected="false" hidden><svg class="i"><use href="#i-vm"/></svg>虚拟机</button>
+  <button type="button" data-page="ups" aria-selected="false" hidden><svg class="i"><use href="#i-battery"/></svg>电源</button>
   <button type="button" data-page="settings" aria-selected="false"><svg class="i"><use href="#i-gear"/></svg>设置</button>
 </nav>
 

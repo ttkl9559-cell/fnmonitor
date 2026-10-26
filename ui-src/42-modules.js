@@ -2,7 +2,8 @@
    03 TRENDS — 历史（/api/history）+ 实时拼接，同步十字线，阈值线
    --------------------------------------------------------------------- */
 const SERIES_SRC = { 'net.rx': ['net', 'rx'], 'net.tx': ['net', 'tx'], 'diskio.r': ['diskio', 'r'], 'diskio.w': ['diskio', 'w'], 'net_bytes.rx': ['net_bytes', 'rx'], 'net_bytes.tx': ['net_bytes', 'tx'] };
-const LIVE_OF = { cpu: 'cpu', mem: 'mem', 'net.rx': 'rx', 'net.tx': 'tx', 'diskio.r': 'dr', 'diskio.w': 'dw', temp: 'temp', temp_mb: 'tempMb', power: 'power', fan_avg: 'fan', disk_total: 'disk', load1: 'load' };
+const LIVE_OF = { cpu: 'cpu', mem: 'mem', 'net.rx': 'rx', 'net.tx': 'tx', 'diskio.r': 'dr', 'diskio.w': 'dw', temp: 'temp', temp_mb: 'tempMb', power: 'power', fan_avg: 'fan', disk_total: 'disk', load1: 'load',
+  ups_load: 'upsLoad', ups_chg: 'upsChg', ups_rt: 'upsRt', ups_in_v: 'upsInV', ups_out_v: 'upsOutV', ups_bat_v: 'upsBatV', ups_temp: 'upsTemp' };
 const histIv = () => (S.cfg && S.cfg.history_interval) || 60;
 async function fetchSeries(keys, range) {
   const bases = [...new Set(keys.map(k => (SERIES_SRC[k] || [k])[0]))], res = {};

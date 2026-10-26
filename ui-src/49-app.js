@@ -75,6 +75,7 @@ function renderNow() {
   if (S.page === 'overview') Hero.update(S.o);
   if (S.page !== 'settings' && !S.editing) orderOf(S.page).forEach(id => { const m = MODS[id]; if (!m || m.el.classList.contains('off') || m.el.hidden) return; if (m.vis) { m.dirty = false; runUpdate(m); } else m.dirty = true; });
   if (sheetCtx && sheetCtx.update && S.o) { try { sheetCtx.update(S.o); sheetCtx.chartTick && sheetCtx.chartTick(); } catch (e) { console.error('[fnmonitor] 抽屉更新失败', e); } }
+  if (S.page === 'ups') renderUpsGuard();
 }
 function setStatus() {
   const d = $('#liveDot'), chip = $('#hostChip');
@@ -139,9 +140,20 @@ Poll.add('monthly', async () => { S.monthly = await API.get('/api/monthly_summar
 Poll.add('weather', async () => { try { S.weather = await API.get('/api/weather'); } catch (e) { S.weather = { ok: false, error: e.message }; } Hero.weather(S.weather); }, 600000, () => S.page === 'overview');
 Poll.add('hist', async () => { if (S.page === 'overview' && modVis('trends') && MODS.trends.res) await MODS.trends.load(); if (sheetCtx && sheetCtx.chartReload) await sheetCtx.chartReload(); }, 60000, () => (S.page === 'overview' && modVis('trends')) || !!(sheetCtx && sheetCtx.chartReload));
 Poll.add('config', async () => { await loadConfig(); syncSettings(); }, 1800000);
+/* UPS：只在启用后轮询（未启用时开关就在设置页，没必要为它花请求） */
+Poll.add('ups', async () => {
+  try {
+    const j = await API.get('/api/ups');
+    S.ups = j; feedUps(j); setUpsTab(!!+(j.enabled || (j.config || {}).enabled)); renderNow();
+  } catch (e) { /* 保留上一帧；连接问题由 overview 统一提示 */ }
+}, 5000, () => !!S.upsTab || S.page === 'settings');
+Poll.add('upsev', async () => { try { S.upsev = (await API.get('/api/ups/events?limit=50')).events || []; renderNow(); } catch (e) {} }, 30000, () => S.page === 'ups');
+Poll.add('upsguard', async () => { try { S.upsGuard = await API.get('/api/ups/guard'); renderNow(); syncSettings(); } catch (e) {} }, 5000, () => S.page === 'ups' || S.page === 'settings');
 function onPageChange(p) {
   if (p === 'docker') Poll.runAll(['docker', 'ports', 'apps']);
   if (p === 'vms') Poll.run('vms');
+  if (p === 'ups') Poll.runAll(['ups', 'upsev', 'upsguard']);
+  if (p === 'settings') Poll.runAll(['ups', 'upsguard']);
   if (p === 'overview') Poll.runAll(['overview', 'diskhealth']);
 }
 function globalRefresh() {
@@ -236,7 +248,9 @@ dmScan(document);
 Hero.build();
 Object.keys(LAYOUT_DEFAULT).forEach(applyLayout);
 setVmTab(S.vmTab);
+setUpsTab(S.upsTab);
 API.get('/api/vms?probe=1').then(j => setVmTab(j && j.installed)).catch(() => {});
+API.get('/api/ups').then(j => { S.ups = j; setUpsTab(!!+(j && (j.enabled || (j.config || {}).enabled))); feedUps(j || {}); renderNow(); }).catch(() => {});
 if (MODS.monthly) MODS.monthly.el.hidden = true;
 setStatus();
 route();

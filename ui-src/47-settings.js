@@ -174,6 +174,9 @@ const SET_SCHEMA = [
       run: () => openSheet('scanlog') },
     cfgToggle('ec_fan_probe', '实验性 · EC 风扇读取', { hint: '通过硬件 I/O 端口读取部分商用机（NEC / 联想）风扇转速，默认关闭', help: '仅在标准 hwmon / IPMI 读不到风扇时使用。该方式直接访问主板 EC 端口（只读），个别机型可能不兼容，如出现异常请关闭。' }),
   ] },
+  { id: 'ups', title: 'UPS 电源', icon: 'battery',
+    desc: '接在 NAS 上的 UPS（经 NUT 读取）：实时读数、电池健康、历史曲线、断电告警与关机保护。启用后顶部导航会出现「电源」页；未启用时不读 UPS、不记历史、不发通知。',
+    custom: renderUps },
   { id: 'notify', title: '通知', icon: 'bell', desc: '硬盘巡检发现故障变化时，把消息推送到邮箱或微信；两个通道各自独立，测试也各测各的。', custom: renderNotify },
   { id: 'idrac', title: 'iDRAC', icon: 'server', desc: '戴尔服务器带外管理：直连 iDRAC 读风扇转速、温度、功耗与硬件日志（只读，不改服务器任何设置）。', custom: renderIdrac },
   { id: 'ignored', title: '已忽略的提醒', icon: 'eye-off', desc: '在 健康检查 中忽略的问题会列在这里：不计入健康分与首页结论；问题状态发生变化（如重映射扇区数增加、级别从留意升为严重、未运行的容器变化）时会自动重新提醒。', custom: renderIgnored },
@@ -204,7 +207,7 @@ const SET_SCHEMA = [
    --------------------------------------------------------------------- */
 const BLOCK_KEEP_COLLECT = ['metrics', 'storage', 'thermal', 'network', 'energy', 'containers'];
 const BLOCK_STOP_COLLECT = ['procs', 'apps', 'ports', 'vms'];
-const BLOCK_PAGE_LABEL = { overview: '总览', docker: '容器', vms: '虚拟机' };
+const BLOCK_PAGE_LABEL = { overview: '总览', docker: '容器', vms: '虚拟机', ups: '电源' };
 
 function renderBlocks(card) {
   card.innerHTML = Object.keys(LAYOUT_DEFAULT).map(p => {

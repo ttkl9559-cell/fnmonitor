@@ -81,7 +81,7 @@ const Pal = {
   items: [], sel: 0, shown: [],
   build() {
     const it = [], add = (g, label, icon, run, hint = '', kw = '') => it.push({ g, label: String(label), icon, run, hint: String(hint), kw: String(kw) });
-    const PI = { overview: ['总览', 'home'], docker: ['容器 · 端口', 'box'], vms: ['虚拟机', 'vm'], settings: ['设置', 'gear'] };
+    const PI = { overview: ['总览', 'home'], docker: ['容器 · 端口', 'box'], vms: ['虚拟机', 'vm'], ups: ['电源', 'battery'], settings: ['设置', 'gear'] };
     navPages().forEach((p, k) => add('页面', PI[p][0], PI[p][1], () => go(p), String(k + 1), p));
     [['health', '健康检查', 'shield'], ['cpu', '处理器', 'cpu'], ['mem', '内存', 'mem'], ['storage', '存储', 'storage'], ['net', '网络', 'net'], ['temp', '温度与散热', 'temp'], ['power', '能耗', 'bolt']].forEach(([k, l, i]) => add('详情', l, i, () => { if (S.page !== 'overview') go('overview'); openSheet(k); }, '', k));
     disksOf(S.o).forEach(d => add('硬盘', `${d.name} · ${vendorModel(d)}`, diskIcon(d), () => { if (S.page !== 'overview') go('overview'); openSheet('disk/' + encodeURIComponent(d.name)); }, isSleep(d) ? '休眠中' : smartState(d).lv === 'warn' ? '需留意' : '', (d.serial || '') + ' ' + KIND_TXT[diskKind(d)]));
@@ -122,15 +122,25 @@ $('#btnSearch').onclick = () => Pal.open();
 /* =====================================================================
    ROUTING  #/page[/sheet]
    ===================================================================== */
-const PAGES = ['overview', 'docker', 'vms', 'settings'];
-const PAGE_TITLE = { overview: '总览', docker: '容器', vms: '虚拟机', settings: '设置' };
-/** 导航里实际显示的页面（本机没有 virsh 时不显示「虚拟机」），数字快捷键按此顺序 */
-const navPages = () => PAGES.filter(p => p !== 'vms' || S.vmTab);
+const PAGES = ['overview', 'docker', 'vms', 'ups', 'settings'];
+const PAGE_TITLE = { overview: '总览', docker: '容器', vms: '虚拟机', ups: '电源', settings: '设置' };
+/** 导航里实际显示的页面（本机没有 virsh 不显示「虚拟机」，没启用 UPS 不显示「电源」），数字快捷键按此顺序 */
+const navPages = () => PAGES.filter(p => (p !== 'vms' || S.vmTab) && (p !== 'ups' || S.upsTab));
 /** 显示 / 隐藏「虚拟机」导航；结果记在本地，下次打开不闪烁 */
 function setVmTab(on) {
   on = !!on; if (S.vmTab === on && $('#pageSeg [data-page="vms"]').hidden === !on) return;
   S.vmTab = on; store.set('vmTab', on);
   $$('#pageSeg [data-page="vms"], #bottomNav [data-page="vms"]').forEach(b => { b.hidden = !on; });
+  placeThumb($('#pageSeg'));
+}
+/** 显示 / 隐藏「电源」导航：只在设置里启用 UPS 监控后出现，未启用时页面也不可达 */
+function setUpsTab(on) {
+  on = !!on;
+  const page = $('#page-ups');
+  if (S.upsTab !== on) { S.upsTab = on; store.set('upsTab', on); }
+  $$('#pageSeg [data-page="ups"], #bottomNav [data-page="ups"]').forEach(b => { b.hidden = !on; });
+  if (page) page.hidden = !on || S.page !== 'ups';
+  if (!on && S.page === 'ups') showPage('overview');
   placeThumb($('#pageSeg'));
 }
 function parseHash() {
@@ -143,8 +153,9 @@ function setHash(push) {
   push ? history.pushState(null, '', h) : history.replaceState(null, '', h);
 }
 function showPage(p) {
+  if (p === 'ups' && !S.upsTab) p = 'overview';   // 未启用 UPS 时该页不存在
   const changed = S.page !== p; S.page = p;
-  PAGES.forEach(x => { const el = $('#page-' + x); el.hidden = x !== p; if (x === p && changed) { el.classList.remove('page-enter'); void el.offsetWidth; el.classList.add('page-enter'); } });
+  PAGES.forEach(x => { const el = $('#page-' + x); el.hidden = x !== p || (x === 'ups' && !S.upsTab); if (x === p && changed) { el.classList.remove('page-enter'); void el.offsetWidth; el.classList.add('page-enter'); } });
   $$('#pageSeg button, #bottomNav button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.page === p)));
   placeThumb($('#pageSeg'));
   $('#btnEdit').style.visibility = p === 'settings' ? 'hidden' : '';
