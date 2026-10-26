@@ -210,6 +210,10 @@ dd .diag-link { margin: 0; height: 24px; }
 /* 设置 → 版块显示 */
 .set-sub { margin: 14px 0 2px; color: var(--ink-3); font-size: 10px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
 .set-card > .set-sub:first-child { margin-top: 0; }
+/* 总开关「未启用即整块收起」用的容器：包起来以后首行不再命中 .set-row:first-child，
+   会丢掉与上面总开关之间的分隔线，这里补回来。 */
+[data-dep-body] > .set-row:first-child,
+[data-dep-body] > .set-sub:first-child + .set-row { border-top: 1px solid var(--line); }
 .blk-row .lbl { transition: opacity .15s ease; }
 .blk-row.blk-off .lbl { opacity: .5; }
 

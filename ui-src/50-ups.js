@@ -192,7 +192,8 @@ function renderUps(card) {
     ['FORCED_SHUTDOWN', '强制关机'], ['DEVICE_LOST', '通信中断'], ['DEVICE_BACK', '通信恢复'],
   ];
   card.innerHTML = `
-    ${UPS_ROW('启用 UPS 监控', '关闭后不读取 UPS、不记录历史、不发通知，「电源」页与导航一起隐藏', `<button class="switch" type="button" role="switch" aria-checked="false" data-k="enabled" aria-label="启用 UPS 监控"></button>`)}
+    ${UPS_ROW('启用 UPS 监控', '关闭后不读取 UPS、不记录历史、不发通知，「电源」页与导航一起隐藏，下面这些设置也一起收起来', `<button class="switch" type="button" role="switch" aria-checked="false" data-k="enabled" aria-label="启用 UPS 监控"></button>`)}
+    <div data-dep-body>
     <div class="set-sub">采集</div>
     ${UPS_ROW('UPS 设备名', '留空 = 自动发现（NUT 里有多台时才需要指定）', upsText('ups_name', '自动发现'), 'data-dep')}
     ${UPS_ROW('采集周期', '默认 5 秒。NUT 驱动自身也有 2 秒轮询，设太小只是多花 CPU', upsNum('poll_interval', 3, 60, 1, '秒'), 'data-dep')}
@@ -203,8 +204,8 @@ function renderUps(card) {
     <div class="set-row" data-dep><div><div class="lbl">通知方式</div><div class="hint">事件发到哪几个通道；都不选就不发，事件仍记录在「事件记录」里</div></div><div class="ctl" data-ref="route"></div></div>
     <div class="set-row block" data-dep><div><div class="lbl">告警事件</div><div class="hint">「严重」级别不受静默时段约束</div></div>
       <div class="ctl up-evs" data-ref="evs">${EV.map(([k, l]) => `<button class="btn sm" type="button" data-ev="${k}" aria-pressed="false">${l}</button>`).join('')}</div></div>
-    ${UPS_ROW('同类事件去抖', '同一类事件在该窗口内只发一次', upsNum('notify_debounce_s', 0, 3600, 10, '秒'))}
-    ${UPS_ROW('每分钟上限', '避免反复抖动把邮箱打爆', upsNum('notify_max_per_min', 1, 60, 1, '条'))}
+    ${UPS_ROW('同类事件去抖', '同一类事件在该窗口内只发一次', upsNum('notify_debounce_s', 0, 3600, 10, '秒'), 'data-dep')}
+    ${UPS_ROW('每分钟上限', '避免反复抖动把邮箱打爆', upsNum('notify_max_per_min', 1, 60, 1, '条'), 'data-dep')}
     ${UPS_ROW('静默时段', '形如 23:00-07:00（可跨零点），留空不静默；严重告警照发', upsText('notify_quiet', '留空不静默'), 'data-dep')}
     ${UPS_ROW('测试通知', '按当前通知渠道发一条 UPS 样例告警', `<button class="btn sm" type="button" data-act="testnotify">${ic('bell')}发送测试</button>`, 'data-dep')}
     <div class="set-sub">关机保护（高危，默认关闭）</div>
@@ -218,7 +219,8 @@ function renderUps(card) {
     ${UPS_ROW('启动静默期', '服务启动后这段时间内不动手，防重启循环关机', upsNum('guard_boot_hold_s', 0, 3600, 10, '秒', 'data-gdep'))}
     ${UPS_ROW('我已知冲突风险', '仅在冲突检测为「有冲突」时需要勾上，否则真关机保存会被拒绝', `<button class="switch" type="button" role="switch" aria-checked="false" data-k="guard_allow_conflict" aria-label="已知冲突风险"></button>`, 'data-gdep')}
     ${UPS_ROW('演练与取消', '演练只跑判定逻辑，绝不关机；取消只对「待执行」有效', `<span class="up-acts"><button class="btn sm" type="button" data-act="sim">${ic('play')}演练判定</button><button class="btn sm" type="button" data-act="cancelnow">取消待执行</button></span>`, 'data-gdep')}
-    <p class="sub up-warn" data-gdep>${ic('alert')}真关机不可撤销：只在下拉确认后使用。运行前请先确认飞牛侧 UPS 保护已关闭，并核对电压下限与断电时长。</p>`;
+    <p class="sub up-warn" data-gdep>${ic('alert')}真关机不可撤销：只在下拉确认后使用。运行前请先确认飞牛侧 UPS 保护已关闭，并核对电压下限与断电时长。</p>
+    </div>`;
 
   const x = collect(card);
   const cfg = () => (S.ups && S.ups.config) || {};
@@ -324,6 +326,10 @@ function renderUps(card) {
 
   card._sync = () => {
     const c = cfg(), on = !!+c.enabled, g = on && !!+c.guard_enabled;
+    // 总开关关闭 → 整块（采集 / 告警 / 关机保护）一起收起，只留上面那一行；
+    // 用容器而不是逐行标记，以后往卡片里加行不会再漏掉。
+    const body = $('[data-dep-body]', card);
+    if (body) body.hidden = !on;
     $$('[data-dep]', card).forEach(el => { el.hidden = !on; });
     $$('[data-gdep]', card).forEach(el => { el.hidden = !g; });
     $$('.set-sub', card).forEach(el => { el.hidden = !on; });

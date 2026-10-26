@@ -524,6 +524,7 @@ async function loadIdrac(opts) {
 function renderIdrac(card) {
   card.innerHTML = `<div class="note info notify-note" data-dep>${ic('server')}<span><b>只读</b>：通过 Redfish 直连 iDRAC 读取风扇转速、温度、功耗与硬件日志，不会改动服务器任何设置。密码单独存 <span class="mono">idrac.json</span>（0600），接口只回「是否已填」。自签证书需要关闭校验，仅建议在内网使用。</span></div>
     <div class="set-row inline"><div><div class="lbl">iDRAC</div><div class="hint" data-ref="hOn"></div></div><div class="ctl"><button class="switch" type="button" role="switch" aria-checked="false" data-ref="swOn" aria-label="启用 iDRAC"></button></div></div>
+    <div data-dep-body>
     <div class="set-row" data-dep><div><div class="lbl">地址</div><div class="hint">iDRAC 管理口 IP 或主机名，只填地址，不要带 https://</div></div><div class="ctl"><input class="textfield mono" data-ref="host" placeholder="192.168.1.120" spellcheck="false" aria-label="iDRAC 地址"></div></div>
     <div class="set-row" data-dep><div><div class="lbl">用户名</div><div class="hint">建议在 iDRAC 里单建一个只读账号</div></div><div class="ctl"><input class="textfield" data-ref="user" placeholder="root" spellcheck="false" autocomplete="username" aria-label="iDRAC 用户名"></div></div>
     <div class="set-row" data-dep><div><div class="lbl">密码</div><div class="hint" data-ref="hPw"></div></div><div class="ctl"><input class="textfield" type="password" data-ref="pw" placeholder="iDRAC 登录密码" autocomplete="new-password" aria-label="iDRAC 密码"></div></div>
@@ -534,7 +535,8 @@ function renderIdrac(card) {
     <div class="set-row" data-dep><div><div class="lbl">告警发送时间</div><div class="hint">每天到这个时刻汇总发一封：只发仍未恢复的；一直没恢复的每 7 天再提醒，期间恢复了补一封「已恢复」</div></div><div class="ctl"><input class="textfield mono" style="width:110px" type="time" data-ref="hwTime" aria-label="告警发送时间"></div></div>
     <div class="set-row" data-dep><div><div class="lbl">连接与保存</div><div class="hint" data-ref="hMsg"></div></div><div class="ctl" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="btn" type="button" data-ref="test">测试连接</button><button class="btn primary" type="button" data-ref="save">保存</button></div></div>
     <div class="set-row inline" data-dep><div><div class="lbl">固定信息</div><div class="hint" data-ref="hStatic">槽位 / 内存 / 阵列卡 / 物理盘 / 卷只在首次连接时读一次，之后不再自动刷新</div></div><div class="ctl"><button class="btn" type="button" data-ref="refresh">刷新固定信息</button></div></div>
-    <div class="idrac-live" data-ref="live" data-dep></div>`;
+    <div class="idrac-live" data-ref="live" data-dep></div>
+    </div>`;
   const x = collect(card);
   const f = { enabled: 0, host: '', user: '', password: '', verify_tls: 0, sel_alert: 1, hw_time: '08:00' };
   const bind = (el, k) => el.addEventListener('input', () => { f[k] = el.value; });
@@ -634,6 +636,8 @@ function renderIdrac(card) {
     const n = (IB && IB.config) || {};
     // 未启用时整页只留「启用」那一行：其余设置项全部收起来
     const on = !!+f.enabled;
+    const body = $('[data-dep-body]', card);
+    if (body) body.hidden = !on;
     $$('[data-dep]', card).forEach(el => { el.hidden = !on; });
     if (hwCh === null) routeEl.sync();
     if (document.activeElement !== x.hwTime) x.hwTime.value = hwTimeEff();
