@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -931,3 +932,141 @@ class SelPairTest(unittest.TestCase):
         self.assertEqual(srv._sel_object("The input power for power supply 2 has been restored."), "psu:2")
         self.assertEqual(srv._sel_object("Drive 12 is removed from disk drive bay 1."), "drive:12")
         self.assertEqual(srv._sel_object("完全看不懂的一句话"), "")
+
+
+STORAGE_JSON = {
+    "Members": [{
+        "Id": "RAID.Integrated.1-1",
+        "Drives": [
+            {"Id": "Disk.Bay.4:Enclosure.Internal.0-1:RAID.Integrated.1-1",
+             "SerialNumber": "WAE06ENM", "Status": {"Health": "OK"}},
+            {"Id": "Disk.Bay.9:Enclosure.Internal.0-1:RAID.Integrated.1-1",
+             "SerialNumber": "Z1Z0-ABCD", "Status": {"Health": "OK"}},
+        ],
+    }]
+}
+
+
+class SlotSyncTest(unittest.TestCase):
+    """手动巡检时顺带核对槽位：只改 bay，其它固定信息一个字都不许动。"""
+
+    def setUp(self):
+        srv._IDRAC_CACHE.clear()
+        srv._SLOT_SYNC_LAST.clear()
+        srv._SLOW_INFLIGHT[0] = 0.0
+        self.dir = tempfile.mkdtemp()
+        self.cfg = {"enabled": 1, "host": "192.168.1.120", "user": "u", "password": "p"}
+
+    def tearDown(self):
+        srv._IDRAC_CACHE.clear()
+        srv._SLOT_SYNC_LAST.clear()
+        srv._SLOW_INFLIGHT[0] = 0.0
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _cfg(self, **kw):
+        cfg = dict(self.cfg)
+        cfg.update(kw)
+        with open(os.path.join(self.dir, srv.IDRAC_FILE), "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+
+    def _ledger(self, disks):
+        self._cfg()
+        srv.idrac_static_write(self.dir, self.cfg,
+                               {"ok": True, "disks": disks, "dimms": [{"slot": "A1"}],
+                                "volumes": [], "static_ts": 1000.0})
+
+    def _ledger_on_disk(self):
+        with open(os.path.join(self.dir, srv.IDRAC_STATIC_FILE), encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_read_bays_from_storage(self):
+        with mock.patch.object(srv, "_idrac_request", fake_req(
+                {"/Systems/System.Embedded.1/Storage": STORAGE_JSON})):
+            bays, err = srv.idrac_read_bays(self.cfg)
+        self.assertEqual(err, "")
+        # 序列号带连字符也要能对上（归一化后比较）
+        self.assertEqual(bays, {"WAE06ENM": 4, "Z1Z0ABCD": 9})
+
+    def test_read_bays_reports_error(self):
+        with mock.patch.object(srv, "_idrac_request", fake_req({})):
+            bays, err = srv.idrac_read_bays(self.cfg)
+        self.assertEqual(bays, {})
+        self.assertTrue(err)
+
+    def test_moved_disk_updates_bay_only(self):
+        self._ledger([{"bay": 5, "serial": "WAE06ENM", "model": "ST4000NM", "cap_gb": 3726},
+                      {"bay": 9, "serial": "Z1Z0ABCD", "model": "ST4000NM", "cap_gb": 3726}])
+        self.assertTrue(srv.idrac_static_ensure_loaded(self.dir, self.cfg))
+        with mock.patch.object(srv, "_idrac_request", fake_req(
+                {"/Systems/System.Embedded.1/Storage": STORAGE_JSON})):
+            r = srv.idrac_slot_sync(self.dir)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["moved"], 1)
+        self.assertEqual(r["details"][0]["from"], 5)
+        self.assertEqual(r["details"][0]["to"], 4)
+        # 内存缓存立刻生效：界面下一次快照就会用新槽位
+        self.assertEqual(srv.idrac_slot_map()["WAE06ENM"], 4)
+        # 落盘：只改 bay，型号 / 容量 / 其它固定信息原样保留
+        d = self._ledger_on_disk()
+        self.assertEqual(d["disks"][0]["bay"], 4)
+        self.assertEqual(d["disks"][0]["model"], "ST4000NM")
+        self.assertEqual(d["disks"][0]["cap_gb"], 3726)
+        self.assertEqual(d["disks"][1]["bay"], 9)
+        self.assertEqual(d["dimms"], [{"slot": "A1"}])
+        self.assertEqual(d["static_ts"], 1000.0)
+
+    def test_no_change_does_not_touch_ledger(self):
+        self._ledger([{"bay": 4, "serial": "WAE06ENM"}, {"bay": 9, "serial": "Z1Z0ABCD"}])
+        self.assertTrue(srv.idrac_static_ensure_loaded(self.dir, self.cfg))
+        p = os.path.join(self.dir, srv.IDRAC_STATIC_FILE)
+        before = os.path.getmtime(p), self._ledger_on_disk()
+        with mock.patch.object(srv, "_idrac_request", fake_req(
+                {"/Systems/System.Embedded.1/Storage": STORAGE_JSON})):
+            r = srv.idrac_slot_sync(self.dir)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["moved"], 0)
+        self.assertEqual((os.path.getmtime(p), self._ledger_on_disk()), before)
+
+    def test_missing_bay_is_filled_but_not_counted_as_moved(self):
+        self._ledger([{"bay": "Enclosure.Internal.0-1", "serial": "WAE06ENM"}])
+        self.assertTrue(srv.idrac_static_ensure_loaded(self.dir, self.cfg))
+        with mock.patch.object(srv, "_idrac_request", fake_req(
+                {"/Systems/System.Embedded.1/Storage": STORAGE_JSON})):
+            r = srv.idrac_slot_sync(self.dir)
+        self.assertEqual(r["moved"], 0)
+        self.assertEqual(self._ledger_on_disk()["disks"][0]["bay"], 4)
+
+    def test_unknown_disk_reported_not_inserted(self):
+        self._ledger([{"bay": 4, "serial": "WAE06ENM"}])
+        self.assertTrue(srv.idrac_static_ensure_loaded(self.dir, self.cfg))
+        with mock.patch.object(srv, "_idrac_request", fake_req(
+                {"/Systems/System.Embedded.1/Storage": STORAGE_JSON})):
+            r = srv.idrac_slot_sync(self.dir)
+        self.assertEqual(r["unknown"], 1)        # Z1Z0ABCD 是台账里没有的新盘
+        self.assertEqual(len(self._ledger_on_disk()["disks"]), 1)
+        self.assertFalse(srv._IDRAC_CACHE["slow"].get("slot_sync_ts"))
+
+    def test_skips_when_disabled(self):
+        self._cfg(enabled=0)
+        r = srv.idrac_slot_sync(self.dir)
+        self.assertTrue(r["ok"])
+        self.assertIn("未启用", r["skipped"])
+
+    def test_skips_without_credentials(self):
+        self._cfg(password="")
+        r = srv.idrac_slot_sync(self.dir)
+        self.assertTrue(r["ok"])
+        self.assertIn("账号", r["skipped"])
+
+    def test_skips_when_no_ledger(self):
+        self._cfg()
+        r = srv.idrac_slot_sync(self.dir)
+        self.assertTrue(r["ok"])
+        self.assertIn("台账", r["skipped"])
+
+    def test_skips_while_full_read_in_flight(self):
+        self._ledger([{"bay": 5, "serial": "WAE06ENM"}])
+        srv._SLOW_INFLIGHT[0] = time.time()
+        r = srv.idrac_slot_sync(self.dir)
+        self.assertTrue(r["ok"])
+        self.assertIn("固定信息", r["skipped"])

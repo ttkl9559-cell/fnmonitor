@@ -4714,7 +4714,7 @@ get: () => notifyRouteGet('disk'),
 set: (v, row) => saveNotifyRoute('disk', v, row),
 hint: () => '巡检发现新增故障 / 加重 / 恢复时发到哪；都不选就不发，变动仍记在巡检历史里' },
 { k: 'diskScanNow', label: '立即巡检', type: 'action', button: '现在巡检一次',
-hint: '不等下一个周期，立刻跑一轮全盘 SMART 并更新盘位分级；换盘或刚装完想马上看到结果时用',
+hint: '不等下一个周期，立刻跑一轮全盘 SMART 并更新盘位分级；换盘或刚装完想马上看到结果时用。手动点还会顺带核对一次 iDRAC 槽位——换过盘位的话自动更正（约 1 分钟）',
 run: async b => {
 b.disabled = true;
 try {

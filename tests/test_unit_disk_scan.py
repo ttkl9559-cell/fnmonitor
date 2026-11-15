@@ -6,6 +6,8 @@
 import os
 import sys
 import tempfile
+import json
+import shutil
 import threading
 import time
 import unittest
@@ -329,10 +331,12 @@ class ScanOnceTest(unittest.TestCase):
             self.assertFalse(srv.disk_scan_once(self.db, {})["ok"])
 
     # ---- 手动「立即巡检」接口 ----
-    def make_app(self, config):
+    def make_app(self, config, data_dir=None):
         app = object.__new__(srv.MonitorApp)
         app.config = config
         app.collector = mock.Mock(db=self.db)
+        app.data_dir = data_dir or tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, app.data_dir, True)
         return app
 
     def test_scan_now_starts_a_thread(self):
@@ -343,6 +347,29 @@ class ScanOnceTest(unittest.TestCase):
             self.assertTrue(out["ok"])
             self.assertTrue(done.wait(3), "后台线程没有真的执行巡检")
         self.assertTrue(out["message"])
+
+    def test_scan_now_also_syncs_idrac_slots(self):
+        """手动巡检顺带核对槽位：换过盘位时台账不会自己变，只能靠这一下。"""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, srv.IDRAC_FILE), "w", encoding="utf-8") as f:
+            json.dump({"enabled": 1, "host": "10.0.0.1", "user": "u", "password": "p"}, f)
+        app = self.make_app({"disk_scan_enabled": 1, "disk_scan_interval_h": 6}, data_dir=d)
+        done = threading.Event()
+        with mock.patch.object(srv, "disk_scan_once", side_effect=lambda *a: None), \
+             mock.patch.object(srv, "idrac_slot_sync", side_effect=lambda *a: done.set()):
+            out = app.api_disk_scan_now()
+        self.assertTrue(out["slot_sync"])
+        self.assertTrue(done.wait(3), "槽位核对线程没有执行")
+        self.assertIn("iDRAC", out["message"])
+
+    def test_scan_now_skips_slot_sync_when_idrac_off(self):
+        app = self.make_app({"disk_scan_enabled": 1, "disk_scan_interval_h": 6})
+        with mock.patch.object(srv, "disk_scan_once", side_effect=lambda *a: None), \
+             mock.patch.object(srv, "idrac_slot_sync", side_effect=AssertionError("不该调用")):
+            out = app.api_disk_scan_now()
+        self.assertFalse(out["slot_sync"])
+        self.assertNotIn("iDRAC", out["message"])
 
     def test_scan_now_refuses_when_disabled(self):
         app = self.make_app({"disk_scan_enabled": 0, "disk_scan_interval_h": 6})

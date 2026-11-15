@@ -5290,6 +5290,98 @@ def idrac_refresh_static_async(data_dir):
     return {"ok": True, "started": True}
 
 
+# 槽位核对：同一时刻只跑一轮，避免和固定信息全量读叠在一起打爆 iDRAC8
+_SLOT_SYNC_LOCK = threading.Lock()
+_SLOT_SYNC_LAST = {}
+
+
+def idrac_read_bays(cfg):
+    """只读「序列号 → 机箱槽位」这一层，跳过卷 / CPU / 内存 / 固件。
+
+    一轮请求 = 1 次 Storage + 每块盘 1 次（3 路并发），比全量固定信息
+    （三十来个请求、1.5~3 分钟）轻得多，适合在手动巡检时顺带核对。"""
+    exp = "$expand=*($levels=1)"
+    d, err = _idrac_request(cfg, "/Systems/System.Embedded.1/Storage", query=exp)
+    if err:
+        return {}, err
+    bays = {}
+    for m in _idrac_items(d, "Members"):
+        m = _idrac_try_fetch(cfg, m)
+        for dv in _idrac_parallel(cfg, _idrac_members(cfg, m, "Drives")):
+            sn = _serial_norm(dv.get("SerialNumber"))
+            bay = _idrac_bay(dv.get("Id"))
+            if sn and isinstance(bay, int):
+                bays.setdefault(sn, bay)
+    return bays, ""
+
+
+def idrac_slot_sync(data_dir):
+    """按 iDRAC 当前的实际槽位，更正固定信息台账里变过的 bay。
+
+    固定信息是刻意固化过的（装机就定死、读一轮几分钟），但**换盘位是例外**：
+    iDRAC 侧立刻就是新槽位，台账还是旧的，界面就会指错位置。这里只改 bay 一个
+    字段，容量 / 型号 / 健康 / 卷 / CPU / 内存原样保留，所以不用重读全量。
+
+    只在「手动巡检」时调用，自动巡检不碰——那会把 iDRAC 变成周期性负载。"""
+    cfg = idrac_load(data_dir)
+    if not (cfg.get("enabled") and cfg.get("host")):
+        return {"ok": True, "skipped": "iDRAC 未启用"}
+    if not (cfg.get("user") and cfg.get("password")):
+        return {"ok": True, "skipped": "iDRAC 账号未填"}
+    if not _SLOT_SYNC_LOCK.acquire(False):
+        return {"ok": True, "busy": True, "skipped": "上一轮槽位核对还没跑完"}
+    try:
+        with _SLOW_LOCK:
+            inflight = _SLOW_INFLIGHT[0]
+        if inflight and time.time() - inflight < 300:
+            return {"ok": True, "skipped": "固定信息正在读取"}
+        if not idrac_static_ensure_loaded(data_dir, cfg):
+            return {"ok": True, "skipped": "固定信息台账还没生成"}
+        bays, err = idrac_read_bays(cfg)
+        if err or not bays:
+            return {"ok": False, "error": err or "iDRAC 没回物理盘列表"}
+        with _IDRAC_LOCK:
+            cur = dict(_IDRAC_CACHE.get("slow") or {})
+        disks = [dict(x) for x in (cur.get("disks") or [])]
+        moved, filled, known = [], 0, set()
+        for d in disks:
+            sn = _serial_norm(d.get("serial"))
+            if not sn:
+                continue
+            known.add(sn)
+            bay = bays.get(sn)
+            if bay is None:          # 这块盘不在 iDRAC 列表里（拔了 / 换了控制器）
+                continue
+            old = d.get("bay")
+            if not isinstance(old, int):
+                d["bay"] = bay       # 老台账没槽位（解析失败），补上不算「换位」
+                filled += 1
+            elif old != bay:
+                moved.append({"serial": str(d.get("serial") or ""), "from": old, "to": bay})
+                d["bay"] = bay
+        # iDRAC 有、台账没有：换进来的新盘。不凭空插一条半成品记录，只报个数，
+        # 让用户知道该点「刷新固定信息」补全容量 / 型号那些字段。
+        unknown = len([sn for sn in bays if sn not in known])
+        _SLOT_SYNC_LAST.clear()
+        _SLOT_SYNC_LAST.update({"ts": time.time(), "moved": len(moved),
+                                "filled": filled, "unknown": unknown})
+        if not moved and not filled:
+            return {"ok": True, "moved": 0, "filled": 0, "unknown": unknown}
+        upd = dict(cur, disks=disks, slot_sync_ts=time.time())
+        with _IDRAC_LOCK:
+            _IDRAC_CACHE["slow"] = dict(upd, ts=float(cur.get("ts") or time.time()))
+        idrac_static_write(data_dir, cfg, upd)
+        if moved:
+            print("[fnmonitor] iDRAC 槽位已更正：%d 块盘换了位置（%s）"
+                  % (len(moved), "、".join("%s→%s" % (m["from"], m["to"]) for m in moved[:8])))
+        return {"ok": True, "moved": len(moved), "filled": filled,
+                "details": moved, "unknown": unknown}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    finally:
+        _SLOT_SYNC_LOCK.release()
+
+
 def idrac_diag():
     """/api/idrac 的排障块：缓存几秒前刷的、有没有慢组、线程在不在。
 
@@ -11543,14 +11635,24 @@ class MonitorApp:
     def api_disk_scan_now(self):
         """手动触发一轮巡检：立刻返回，不等结果（前端隔十几秒刷新盘位即可）。
 
-        换盘、调间隔、刚装完想马上看到分级都靠它，不用等下一个周期。"""
+        换盘、调间隔、刚装完想马上看到分级都靠它，不用等下一个周期。
+        顺带核对一次 iDRAC 槽位：换过盘位的话台账还是旧位置，而巡检是「人发现
+        不对」时最常点的地方，放在这里正好。自动巡检不碰 iDRAC。"""
         if disk_scan_interval_h(self.config) <= 0:
             return {"ok": False, "error": "disabled", "message": "硬盘巡检已关闭，先在设置里打开"}
         if _DISK_SCAN_LOCK.locked() or _disk_scan_state.get("running"):
             return {"ok": False, "error": "busy", "message": "巡检正在进行中，稍等十几秒"}
         threading.Thread(target=disk_scan_once, args=(self.collector.db, self.config),
                          name="disk-scan-manual", daemon=True).start()
-        return {"ok": True, "started": True, "message": "已开始巡检，约 15–20 秒后刷新"}
+        icfg = idrac_load(self.data_dir)
+        slot_on = bool(icfg.get("enabled") and icfg.get("host")
+                       and icfg.get("user") and icfg.get("password"))
+        if slot_on:
+            threading.Thread(target=idrac_slot_sync, args=(self.data_dir,),
+                             name="idrac-slot-sync", daemon=True).start()
+        return {"ok": True, "started": True, "slot_sync": slot_on,
+                "message": "已开始巡检，约 15–20 秒后刷新"
+                           + ("；同时在核对 iDRAC 槽位，换过盘位会自动更正（约 1 分钟）" if slot_on else "")}
 
     def api_scan_log(self, query=None):
         """巡检流水：每次巡检一行，有变化记变化内容、没变化记未见异常。
