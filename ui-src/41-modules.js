@@ -160,7 +160,7 @@ defineModule({
           <div class="ch-top"><span class="pwr" title="电源"><i></i></span><span data-ref="chName"></span><span class="vent"></span><span data-ref="chModel">NAS</span></div>
           <div class="bays" data-ref="bays"></div>
         </div>
-        <div class="nas-foot"><span><i class="led-key"></i>正常</span><span><i class="led-key warn"></i>留意</span><span><i class="led-key crit"></i>故障</span><span><i class="led-key off"></i>休眠 / 未巡检</span><span class="faint scan-ago" data-ref="scanAgo"></span><span class="faint">点击盘位查看 SMART 详情 · 盘位按存储空间排列</span></div>
+        <div class="nas-foot"><span><i class="led-key"></i>正常</span><span><i class="led-key warn"></i>留意</span><span><i class="led-key crit"></i>故障</span><span><i class="led-key off"></i>休眠 / 未巡检</span><span class="faint scan-ago" data-ref="scanAgo"></span><span class="faint rotate-tip" data-ref="rotateTip" hidden></span><span class="faint">点击盘位查看 SMART 详情 · 盘位按存储空间排列</span></div>
       </div>
       <div data-ref="raid"></div>`;
     m.x = collect(body); m.bays = {}; m.io = {};
@@ -220,6 +220,13 @@ defineModule({
     });
     const ago = scanAgo();
     if (x.scanAgo) setText(x.scanAgo, S.diskHealth ? (ago ? `巡检于 ${ago}` : '尚未巡检') : '');
+    /* 换盘位 / 重启后内核会重排 sdX，库里的巡检记录仍挂在旧名字上：序列号是对的，
+       但每块盘显示的健康数据会串位。明确提示一次，别让人对着错位数据排查。 */
+    const rot = dd.filter(d => d.health_dev).length;
+    if (x.rotateTip) {
+      setText(x.rotateTip, rot ? `${rot} 块盘的编号已变（换过盘位？），SMART 仍取自上次巡检 · 建议重新巡检` : '');
+      x.rotateTip.hidden = !rot;
+    }
     // 阵列（mdadm / 阵列卡）概要
     const raid = o.raid || [], rc = o.raidcard || {};
     setHTML(x.raid, raid.length || (rc.type && rc.type !== 'none') ? `<div class="card pad raid-sum tap" data-sheet="storage" role="button" tabindex="0"><div class="label">${ic('server')}阵列<span class="faint" style="margin-left:auto;font-weight:400">${esc(rc.label || '')}</span></div><div class="raid-chips">${raid.map(r => `<span class="pill ${(r.members || []).some(z => /\(F\)/.test(z)) ? 'crit' : 'ok'}"><span class="dot"></span>${esc(r.device)} · ${esc(r.status)}</span>`).join('')}${(rc.controllers || []).map(c => (c.vd || []).map(v => `<span class="pill ${v.badge === 'off' ? 'crit' : v.badge === 'on' ? 'ok' : ''}"><span class="dot"></span>VD${esc(v.vd)} ${esc(v.type || '')} · ${esc(v.state_label || v.state || '--')}</span>`).join('')).join('')}${rc.type && rc.type !== 'none' && !(rc.controllers || []).length ? `<span class="pill">${esc(rc.detail || rc.error || '未读取到阵列卡详情')}</span>` : ''}</div></div>` : '');

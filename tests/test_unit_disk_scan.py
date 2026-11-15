@@ -439,3 +439,100 @@ class ScanLogLabelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+LSBLK_ROTATED = json.dumps({"blockdevices": [
+    {"name": "sda", "model": "ST300MP0026", "vendor": "SEAGATE", "size": 300000000000,
+     "fstype": None, "mountpoint": None, "ro": False, "type": "disk", "serial": "WAE0J50J"},
+    {"name": "sdb", "model": "MG04SCA40ENY", "vendor": "TOSHIBA", "size": 4000000000000,
+     "fstype": None, "mountpoint": None, "ro": False, "type": "disk", "serial": "48J0A4B6F74E"},
+]})
+
+
+class HealthBySerialTest(unittest.TestCase):
+    """换盘位后 sdX 会重排，库里的记录还挂着旧设备名。
+
+    只按设备名取，就把邻居盘的序列号 / 健康 / 缺陷计数挂到这块盘上——现场看到的
+    「整张盘位表错位」就是这么来的。序列号才是两边的公共键。
+    """
+
+    def setUp(self):
+        srv._DISK_HEALTH_MEM.clear()
+        srv._DISK_TEMP_CACHE.clear()
+
+    def tearDown(self):
+        srv._DISK_HEALTH_MEM.clear()
+        srv._DISK_TEMP_CACHE.clear()
+
+    def test_serial_wins_over_stale_dev(self):
+        # 换位前：sda 那块盘是 48J0A4B6F74E，现在它在 sdb 上
+        srv._DISK_HEALTH_MEM["sda"] = {"dev": "sda", "serial": "48J0A4B6F74E", "health": "OK"}
+        srv._DISK_HEALTH_MEM["sdb"] = {"dev": "sdb", "serial": "WAE0J50J", "health": "PASSED"}
+        rec = srv._health_rec("sda", "WAE0J50J")
+        self.assertEqual(rec["health"], "PASSED")      # 取的是 sdb 那条记录
+        self.assertEqual(rec["dev"], "sdb")
+
+    def test_falls_back_to_dev_when_serial_missing(self):
+        srv._DISK_HEALTH_MEM["sda"] = {"dev": "sda", "serial": "48J0A4B6F74E", "health": "OK"}
+        self.assertEqual(srv._health_rec("sda", "")["health"], "OK")
+
+    def test_falls_back_to_dev_when_serial_unknown(self):
+        srv._DISK_HEALTH_MEM["sda"] = {"dev": "sda", "serial": "48J0A4B6F74E", "health": "OK"}
+        self.assertEqual(srv._health_rec("sda", "NOSUCHSERIAL")["health"], "OK")
+
+    def test_empty_cache_returns_empty(self):
+        self.assertEqual(srv._health_rec("sda", "WAE0J50J"), {})
+
+    def test_serial_normalisation(self):
+        # iDRAC / smartctl 的写法差异（连字符、大小写、空格）不能影响匹配
+        srv._DISK_HEALTH_MEM["sda"] = {"dev": "sda", "serial": "z1z0-abcd", "health": "OK"}
+        self.assertEqual(srv._health_rec("sdz", " Z1Z0ABCD ")["health"], "OK")
+
+
+class DisksDetailRotatedTest(unittest.TestCase):
+    """collect_disks_detail：换位后仍把正确的 SMART 挂到当前设备名上。"""
+
+    def setUp(self):
+        srv._DISK_HEALTH_MEM.clear()
+        srv._DISK_TEMP_CACHE.clear()
+
+    def tearDown(self):
+        srv._DISK_HEALTH_MEM.clear()
+        srv._DISK_TEMP_CACHE.clear()
+
+    def _detail(self):
+        with mock.patch.object(srv, "run_cmd", return_value=(LSBLK_ROTATED, 0)), \
+             mock.patch.object(srv, "collect_disks", return_value=[]):
+            return srv.collect_disks_detail(with_temps=False, with_states=False)
+
+    def test_rotated_disks_get_right_smart(self):
+        # 库里的记录还是换位前的：sda 记的是 48J0A4B6F74E 那块盘
+        srv._DISK_HEALTH_MEM["sda"] = {"dev": "sda", "serial": "48J0A4B6F74E",
+                                       "health": "OK", "reallocated_sectors": 7,
+                                       "pending_sectors": 0, "uncorrectable": 0}
+        srv._DISK_HEALTH_MEM["sdb"] = {"dev": "sdb", "serial": "WAE0J50J",
+                                       "health": "PASSED", "reallocated_sectors": 0,
+                                       "pending_sectors": 0, "uncorrectable": 0}
+        rows = {r["name"]: r for r in self._detail()}
+        # sda 现在装的是 WAE0J50J，就拿 WAE0J50J 的记录
+        self.assertEqual(rows["sda"]["serial"], "WAE0J50J")
+        self.assertEqual(rows["sda"]["health"], "PASSED")
+        self.assertEqual(rows["sda"]["health_dev"], "sdb")
+        # sdb 现在装的是 48J0A4B6F74E
+        self.assertEqual(rows["sdb"]["serial"], "48J0A4B6F74E")
+        self.assertEqual(rows["sdb"]["reallocated_sectors"], 7)
+        self.assertEqual(rows["sdb"]["health_dev"], "sda")
+
+    def test_no_rotation_has_no_flag(self):
+        srv._DISK_HEALTH_MEM["sda"] = {"dev": "sda", "serial": "WAE0J50J", "health": "OK"}
+        srv._DISK_HEALTH_MEM["sdb"] = {"dev": "sdb", "serial": "48J0A4B6F74E", "health": "OK"}
+        rows = {r["name"]: r for r in self._detail()}
+        for name in ("sda", "sdb"):
+            self.assertNotIn("health_dev", rows[name], name)
+            self.assertEqual(rows[name]["health"], "OK")
+
+    def test_serial_from_lsblk_used_when_no_health_cache(self):
+        """巡检还没跑过：设备名至少有 lsblk 给的序列号，不再显示空。"""
+        rows = {r["name"]: r for r in self._detail()}
+        self.assertEqual(rows["sda"]["serial"], "WAE0J50J")
+        self.assertEqual(rows["sdb"]["serial"], "48J0A4B6F74E")

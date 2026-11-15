@@ -778,7 +778,9 @@ def collect_disks_detail(prev=None, with_temps=True, with_states=True):
             _walk_mounts(ch, acc)
 
     out, rc = run_cmd(
-        ["lsblk", "-b", "-J", "-o", "NAME,MODEL,VENDOR,SIZE,FSTYPE,MOUNTPOINT,RO,TYPE"],
+        # SERIAL 必须带上：换盘位 / 热插拔后内核会重排 sdX，只有序列号能把
+        # 当前设备名对回库里的巡检记录（见 _health_rec）
+        ["lsblk", "-b", "-J", "-o", "NAME,MODEL,VENDOR,SIZE,FSTYPE,MOUNTPOINT,RO,TYPE,SERIAL"],
         timeout=10,
     )
     if rc != 0 or not out.strip():
@@ -808,6 +810,7 @@ def collect_disks_detail(prev=None, with_temps=True, with_states=True):
             continue
         model = (blk.get("model") or "").strip()
         vendor = (blk.get("vendor") or "").strip()
+        blk_serial = (blk.get("serial") or "").strip()
         size = blk.get("size") or 0
         mount_paths = []
         _walk_mounts(blk, mount_paths)
@@ -836,7 +839,7 @@ def collect_disks_detail(prev=None, with_temps=True, with_states=True):
             "health": old.get("health", ""),
             "rpm": old.get("rpm", ""),
             "power_on_hours": old.get("power_on_hours", ""),
-            "serial": old.get("serial", ""),
+            "serial": blk_serial or old.get("serial", ""),
         }
         # SMART 告警计数（ATA 属性 5/196/197/198/199）：休眠盘沿用上一次活跃时的值，
         # 未知（NVMe / 读取失败）为 None
@@ -846,9 +849,13 @@ def collect_disks_detail(prev=None, with_temps=True, with_states=True):
         # 全盘扫一次），这样 60 秒采集循环对任何盘数都不再跑 smartctl——原来「只读前
         # 8 块盘」的上限就是为了压制这个开销，缓存到位后上限没有存在意义，直接解掉。
         # 巡检还没覆盖到的盘（首装的前 60 秒）沿用旧行为：最多补读 8 块，避免首屏空白。
+        sd = _health_rec(name, blk_serial)
+        # 这条 SMART 记录原本挂在哪个设备名上：与当前 name 不同说明盘位编号变了
+        # （换盘位 / 重启），序列号本身仍正确，页面提示「重新巡检」即可。
+        if sd.get("dev") and sd["dev"] != name:
+            entry["health_dev"] = sd["dev"]
         if state != "standby":
-            sd = _DISK_HEALTH_MEM.get(name)
-            if sd is None and with_states:
+            if not sd and with_states:
                 sd = smart_detail(name) if len(result) < 8 else {}
             if sd.get("standby"):
                 entry["state"] = "standby"
@@ -863,8 +870,15 @@ def collect_disks_detail(prev=None, with_temps=True, with_states=True):
                         entry[_k] = sd[_k]
                 if sd.get("temp_c") is not None and entry["temp"] is None:
                     entry["temp"] = sd["temp_c"]
-        if state == "standby" and not entry["health"]:
-            entry["health"] = "休眠"
+        if state == "standby":
+            # 休眠盘不读 SMART，但序列号/健康仍要按序列号对回正确的那条记录，
+            # 否则换位后休眠盘会挂着邻居盘的历史
+            if not entry["serial"] and sd.get("serial"):
+                entry["serial"] = sd["serial"]
+            if not entry["health"] and sd.get("health"):
+                entry["health"] = sd["health"]
+            if not entry["health"]:
+                entry["health"] = "休眠"
         result.append(entry)
     return result
 
@@ -3288,7 +3302,29 @@ def _health_row_rec(r):
         "pending_sectors": r.get("pending_defects"),
         "uncorrectable": r.get("uncorr"),
         "scsi": (r.get("proto") or "") == "SAS",
+        # 这条记录原本挂在哪个设备名上：换盘位后 dev 会重排，靠它提示「编号已变」
+        "dev": r.get("dev") or "",
     }
+
+
+def _health_rec(dev, serial=""):
+    """取某块盘的巡检结果：**先把 dev 名换成序列号再找**。
+
+    设备名由内核枚举，换盘位 / 热插拔 / 重启都会重排；库里的记录是按写入当时的
+    dev 名存的。只按名字取，换位后就会把邻居盘的 SMART 挂到这块盘上（序列号、
+    健康、缺陷计数一起错位）。序列号是两边唯一的稳定标识，优先按它对齐，
+    取不到序列号（部分盘不报）才退回设备名。
+    """
+    rec = _DISK_HEALTH_MEM.get(dev)
+    sn = _serial_norm(serial)
+    if not sn:
+        return rec or {}
+    if rec and _serial_norm(rec.get("serial")) == sn:
+        return rec
+    for r in _DISK_HEALTH_MEM.values():
+        if _serial_norm((r or {}).get("serial")) == sn:
+            return r
+    return rec or {}
 
 
 def preload_disk_health(db):
@@ -3318,6 +3354,7 @@ def preload_disk_health(db):
         if not dev or r.get("standby") or dev in _DISK_HEALTH_MEM:
             continue
         rec = _health_row_rec(r)
+        rec["dev"] = rec.get("dev") or dev
         _DISK_HEALTH_MEM[dev] = rec
         # 温度一并预热，省掉首轮对每块盘的 smartctl -A（SAS 盘没有 hwmon）
         if rec.get("temp_c") is not None and dev not in _DISK_TEMP_CACHE:
@@ -3353,7 +3390,7 @@ def disk_scan_once(db, config=None):
             # 顺手刷新按需读的缓存：巡检刚读到的数据，详情面板不必再跑一次 smartctl
             if rec and not rec.get("standby"):
                 _SMART_CACHE[dev] = (ts, rec)
-                _DISK_HEALTH_MEM[dev] = rec
+                _DISK_HEALTH_MEM[dev] = dict(rec, dev=dev)
             old = prev_row_for({"dev": dev, "serial": rec.get("serial")}, prev_idx) or {}
             if rec.get("standby"):
                 # 休眠盘不唤醒：沿用上次分级与计数，只标记状态
