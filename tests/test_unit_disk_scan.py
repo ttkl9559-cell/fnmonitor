@@ -536,3 +536,46 @@ class DisksDetailRotatedTest(unittest.TestCase):
         rows = {r["name"]: r for r in self._detail()}
         self.assertEqual(rows["sda"]["serial"], "WAE0J50J")
         self.assertEqual(rows["sdb"]["serial"], "48J0A4B6F74E")
+
+
+class DiskHealthBySerialTest(unittest.TestCase):
+    """/api/disk_health 的分级要能按序列号索引。
+
+    盘位卡只认这个接口。它原来只给 items[dev]，而 dev 名换盘位就会变，卡片于是
+    挂上邻居盘的分级——同一个界面里抽屉（走 disks_detail，按序列号）却是对的，
+    用户看到的就是「卡片标黄、点进去是绿的」。
+    """
+
+    def _app(self, rows):
+        app = object.__new__(srv.MonitorApp)
+        app.config = {"disk_scan_enabled": 1, "disk_scan_interval_h": 6}
+        db = mock.Mock()
+        db.disk_health_read.return_value = rows
+        app.collector = mock.Mock(db=db)
+        return app
+
+    def test_indexes_by_normalised_serial(self):
+        rows = {
+            "sda": {"serial": "WAE0-J50J", "grade": "warn", "detail": "增长缺陷 52 个", "scan_ts": 100},
+            "sdl": {"serial": "52L0A0UQFYZG", "grade": "warn", "detail": "增长缺陷 23 个", "scan_ts": 100},
+        }
+        j = self._app(rows).api_disk_health()
+        idx = j["items_by_serial"]
+        self.assertEqual(idx["WAE0J50J"]["detail"], "增长缺陷 52 个")      # 连字符不影响匹配
+        self.assertEqual(idx["52L0A0UQFYZG"]["detail"], "增长缺陷 23 个")
+        self.assertEqual(j["items"]["sda"]["grade"], "warn")             # 老字段保留
+
+    def test_duplicate_serial_keeps_newest(self):
+        # 换位后老库可能留下两条序列号相同、dev 不同的记录
+        rows = {
+            "sda": {"serial": "WAE0J50J", "grade": "ok", "detail": "", "scan_ts": 100},
+            "sdd": {"serial": "WAE0J50J", "grade": "warn", "detail": "增长缺陷 52 个", "scan_ts": 200},
+        }
+        idx = self._app(rows).api_disk_health()["items_by_serial"]
+        self.assertEqual(idx["WAE0J50J"]["detail"], "增长缺陷 52 个")
+
+    def test_empty_serial_not_indexed(self):
+        rows = {"sda": {"serial": "", "grade": "ok", "scan_ts": 100}}
+        j = self._app(rows).api_disk_health()
+        self.assertEqual(j["items_by_serial"], {})
+        self.assertIn("sda", j["items"])                                 # 没序列号仍可按 dev 兜底

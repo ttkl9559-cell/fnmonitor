@@ -139,11 +139,23 @@ function smartState(d) {
    盘位卡片只读巡检缓存：open 页面时不跑 smartctl，分级来自后台定时巡检。
    没有缓存时（首装 / 刚重启）一律 unknown，绝不能默认显示「正常」。 */
 const DISK_GRADE_TXT = { ok: '正常', warn: '留意', crit: '故障', unknown: '未巡检' };
-const diskHealthOf = name => (S.diskHealth && S.diskHealth.items && S.diskHealth.items[name]) || null;
+/** 序列号归一：去空格 / 连字符 / 大小写，与后端 _serial_norm 一致 */
+const snKey = s => String(s || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+/** 这块盘的巡检分级：**序列号优先**，取不到才退回设备名。
+    dev 名是内核按枚举顺序给的，换盘位 / 热插拔 / 重启都会重排，而库里存的还是
+    写入当时的名字；只按 dev 名取，盘位卡就会挂上邻居盘的分级——抽屉走的是
+    disks_detail 那条按序列号对齐的路径，于是出现「卡片标黄、点进去是绿的」。 */
+function diskHealthOf(d) {
+  const h = S.diskHealth;
+  if (!d || !h) return null;
+  const sn = snKey(d.serial);
+  const hit = sn && h.items_by_serial && h.items_by_serial[sn];
+  return hit || (h.items && h.items[d.name]) || null;
+}
 /** 盘位卡片用的分级状态：休眠 > 巡检结论 > 未巡检 */
 function bayState(d) {
   if (isSleep(d)) return { lv: 'standby', text: '休眠中', detail: '' };
-  const h = diskHealthOf(d.name);
+  const h = diskHealthOf(d);
   if (!h) {
     // 巡检还没跑过：用按需拿到的 SMART 兜底，但明确标注未巡检
     const sm = smartState(d);

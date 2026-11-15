@@ -2189,10 +2189,17 @@ if (/PASS|OK/.test(h)) return { lv: '', text: 'SMART 通过' };
 return { lv: 'none', text: d.health && d.health !== '未知' ? d.health : '未读取到 SMART' };
 }
 const DISK_GRADE_TXT = { ok: '正常', warn: '留意', crit: '故障', unknown: '未巡检' };
-const diskHealthOf = name => (S.diskHealth && S.diskHealth.items && S.diskHealth.items[name]) || null;
+const snKey = s => String(s || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+function diskHealthOf(d) {
+const h = S.diskHealth;
+if (!d || !h) return null;
+const sn = snKey(d.serial);
+const hit = sn && h.items_by_serial && h.items_by_serial[sn];
+return hit || (h.items && h.items[d.name]) || null;
+}
 function bayState(d) {
 if (isSleep(d)) return { lv: 'standby', text: '休眠中', detail: '' };
-const h = diskHealthOf(d.name);
+const h = diskHealthOf(d);
 if (!h) {
 const sm = smartState(d);
 if (sm.lv === 'crit' || sm.lv === 'warn') return { lv: sm.lv, text: sm.text, detail: '' };

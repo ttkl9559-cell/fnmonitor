@@ -11740,11 +11740,11 @@ class MonitorApp:
         except Exception:
             rows = {}
         hours = disk_scan_interval_h(self.config)
-        items, last = {}, 0.0
+        items, by_serial, last = {}, {}, 0.0
         for dev, r in rows.items():
             ts = float(r.get("scan_ts") or 0)
             last = max(last, ts)
-            items[dev] = {
+            item = {
                 "dev": dev,
                 "grade": r.get("grade") or "unknown",
                 "detail": r.get("detail") or "",
@@ -11763,6 +11763,17 @@ class MonitorApp:
                 "scan_ts": ts,
                 "age": int(now - ts) if ts else None,
             }
+            items[dev] = item
+            # 同一份分级再按序列号索引一份：dev 名是内核枚举的，换盘位 / 热插拔 /
+            # 重启都会重排，而库里存的还是写入当时的名字。前端按序列号取不到才退回
+            # dev 名，否则盘位卡上的分级会挂到邻居盘上（抽屉用的是另一条路径，就出现
+            # 「卡片标黄、点进去是绿的」这种自相矛盾）。
+            sn = _serial_norm(r.get("serial"))
+            if sn:
+                prev = by_serial.get(sn)
+                # 老库可能因换位留下两条序列号相同、dev 不同的记录，留最新的那条
+                if prev is None or ts >= float(prev.get("scan_ts") or 0):
+                    by_serial[sn] = item
         state = dict(_disk_scan_state)
         return {
             "ok": True,
@@ -11775,6 +11786,7 @@ class MonitorApp:
             "summary": state.get("summary") or {},
             "error": state.get("error") or "",
             "items": items,
+            "items_by_serial": by_serial,
             "now": now,
         }
 
