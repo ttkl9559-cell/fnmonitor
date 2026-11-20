@@ -670,6 +670,139 @@ def disk_usage(mountpoint):
         return {"total": 0, "used": 0, "free": 0, "percent": 0.0, "fsid": 0}
 
 
+_FS_MAP_CACHE = {"ts": 0.0, "data": {}}
+
+
+def _parse_zfs_pools(text):
+    """解析 `zpool status -P`：{池名: [成员设备路径]}。"""
+    pools, cur = {}, ""
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.startswith("pool:"):
+            cur = s.split(":", 1)[1].strip()
+            pools.setdefault(cur, [])
+        elif cur and s.startswith("/dev/"):
+            # 后面还跟着 STATE/READ/WRITE/CKSUM 四列，只取设备路径
+            pools[cur].append(s.split()[0])
+    return pools
+
+
+def _parse_zfs_datasets(text):
+    """解析 `zfs list -H -o name,mountpoint`：{数据集名: 挂载点}（跳过 legacy/none）。"""
+    out = {}
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        name, mp = parts[0].strip(), parts[1].strip()
+        if name and mp.startswith("/"):
+            out[name] = mp
+    return out
+
+
+def _parse_btrfs_fs(text):
+    """解析 `btrfs filesystem show`：[[成员设备, ...], ...]（每个文件系统一组）。"""
+    groups, cur = [], []
+    for line in (text or "").splitlines():
+        if line.startswith("Label:"):
+            if cur:
+                groups.append(cur)
+            cur = []
+            continue
+        m = re.search(r"\bpath\s+(\S+)\s*$", line.strip())
+        if m:
+            cur.append(os.path.basename(m.group(1)))
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _zfs_member_mounts():
+    """ZFS 池成员分区 → 挂载点。
+
+    ZFS 的挂载点在 dataset 上，块设备本身没有挂载点，lsblk 的 MOUNTPOINT 因此是空的，
+    整盘会被判成「未挂载」（用量也一并不见了）。"""
+    if not shutil.which("zpool"):
+        return {}
+    out, rc = run_cmd(["zpool", "status", "-P"], timeout=10)
+    if rc != 0 or not out.strip():
+        return {}
+    pools = _parse_zfs_pools(out)
+    if not pools:
+        return {}
+    out2, rc2 = run_cmd(["zfs", "list", "-H", "-o", "name,mountpoint"], timeout=10)
+    if rc2 != 0:
+        return {}
+    ds = _parse_zfs_datasets(out2)
+    res = {}
+    for pool, vdevs in pools.items():
+        mps = [mp for name, mp in ds.items()
+               if name == pool or name.startswith(pool + "/")]
+        if not mps:
+            continue
+        for v in vdevs:
+            dev = os.path.basename(os.path.realpath(v))
+            if not dev:
+                continue
+            res.setdefault(dev, [])
+            for mp in mps:
+                if mp not in res[dev]:
+                    res[dev].append(mp)
+    return res
+
+
+def _btrfs_member_mounts(by_dev):
+    """多设备 btrfs 的其它成员 → 挂载点。
+
+    /proc/mounts 只记挂载时用的那一块盘，btrfs RAID 里其余成员在 lsblk 看来没有挂载点，
+    也会被显示成「未挂载」。同一文件系统的成员共享同一组挂载点。"""
+    if not shutil.which("btrfs"):
+        return {}
+    out, rc = run_cmd(["btrfs", "filesystem", "show"], timeout=10)
+    if rc != 0 or not out.strip():
+        return {}
+    res = {}
+    for members in _parse_btrfs_fs(out):
+        if len(members) < 2:
+            continue
+        mps = []
+        for d in members:
+            for mp in by_dev.get(d, []):
+                if mp not in mps:
+                    mps.append(mp)
+        if not mps:
+            continue
+        for d in members:
+            res.setdefault(d, [])
+            for mp in mps:
+                if mp not in res[d]:
+                    res[d].append(mp)
+    return res
+
+
+def fs_member_mounts():
+    """lsblk 看不到的挂载：ZFS dataset 与多设备 btrfs。返回 {设备名: [挂载点]}。
+
+    lsblk 的 MOUNTPOINT 取自 /proc/mounts 的「设备」列，所以这两类文件系统会漏：
+    ZFS 挂载在 dataset 上（没有块设备），btrfs 多设备时只记挂载时用的那一块。
+    漏掉的后果是盘位卡显示「未挂载」、用量为 0，而总容量却又算上了——自相矛盾。
+    30 秒缓存，两个调用方在同一轮采集里共用。"""
+    now = time.time()
+    if _FS_MAP_CACHE["ts"] and now - _FS_MAP_CACHE["ts"] <= 30:
+        return dict(_FS_MAP_CACHE["data"])
+    res = {}
+    if is_linux():
+        by_dev = {}
+        for m in read_mounts():
+            dev = os.path.basename(m["device"] or "")
+            if dev and (m["mount"] or "").startswith("/"):
+                by_dev.setdefault(dev, []).append(m["mount"])
+        res.update(_btrfs_member_mounts(by_dev))
+        res.update(_zfs_member_mounts())
+    _FS_MAP_CACHE.update({"ts": now, "data": res})
+    return dict(res)
+
+
 # 伪文件系统（proc/sys/tmpfs/overlay 等，不是磁盘空间）
 _PSEUDO_FS = {
     "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2",
@@ -793,6 +926,8 @@ def collect_disks_detail(prev=None, with_temps=True, with_states=True):
     mounts = {}
     for d in collect_disks():
         mounts[d["mount"]] = d
+    # ZFS / 多设备 btrfs：lsblk 的 MOUNTPOINT 里看不到，按成员设备补回来
+    fs_map = fs_member_mounts()
     # 温度（read_temps 内部同样跳过休眠盘并返回缓存温度）
     temp_by = {}
     if with_temps:
@@ -814,6 +949,12 @@ def collect_disks_detail(prev=None, with_temps=True, with_states=True):
         size = blk.get("size") or 0
         mount_paths = []
         _walk_mounts(blk, mount_paths)
+        # ZFS dataset / btrfs 其它成员：按设备名把挂载点补上
+        part_names = [name] + [c.get("name") for c in (blk.get("children") or []) if c.get("name")]
+        for _pn in part_names:
+            for _mp in fs_map.get(_pn, []):
+                if _mp not in mount_paths:
+                    mount_paths.append(_mp)
         used = 0
         total = 0
         for mp in mount_paths:
@@ -1676,6 +1817,14 @@ def _mount_disk_map():
                     _add(mp, root)
     except Exception:
         pass
+    # 3) ZFS / 多设备 btrfs：lsblk 的 MOUNTPOINT 看不到这些挂载，按成员设备归回各自的盘
+    for dev, mps in fs_member_mounts().items():
+        mm = re.match(r"^(sd[a-z]+|vd[a-z]+|xvd[a-z]+)\d*$", dev) \
+            or re.match(r"^(nvme\d+n\d+)(p\d+)?$", dev)
+        if not mm:
+            continue
+        for mp in mps:
+            _add(mp, mm.group(1))
     with _MOUNT_DISK_LOCK:
         _MOUNT_DISK_CACHE["mounts"] = {k: list(v) for k, v in result.items()}
         _MOUNT_DISK_CACHE["ts"] = now
